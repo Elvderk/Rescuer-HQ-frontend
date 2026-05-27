@@ -1,0 +1,6 @@
+{
+  "name": "Rescuer HQ Flutter Arch Hub",
+  "description": "An interactive digital architect hub and live event simulator for the Rescuer HQ Mobile Search & Rescue platform. Explore production-ready Flutter skeleton files, trace realtime events, and talk with a senior AI code-architect.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
