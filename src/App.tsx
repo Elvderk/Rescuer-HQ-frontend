@@ -1022,6 +1022,76 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
+                <div className="border-t border-slate-800/80 pt-2.5 space-y-1">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block">Realtime Emergency SOS:</span>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "EMERGENCY BROADCAST: sos.created -> 'Заря-4 (Иванова)' has triggered life-threatening distress alert!",
+                          "sos",
+                          "danger",
+                          JSON.stringify({
+                            event: "sos.created",
+                            sos_id: "sos_alert_894",
+                            volunteer_id: "vol_44",
+                            callsign: "Заря-4 (Иванова)",
+                            latitude: 55.7562,
+                            longitude: 37.6169,
+                            battery_level: 82,
+                            network_state: "OK",
+                            status: "active",
+                            triggered_at: new Date().toISOString()
+                          })
+                        );
+                        setDriftDatabaseSize(prev => parseFloat((prev + 0.12).toFixed(2)));
+                      }}
+                      className="py-1 px-1 bg-red-950/45 hover:bg-red-900/65 border border-red-900/60 hover:border-red-700/80 text-red-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Plus className="w-2.5 h-2.5 animate-pulse" />
+                      WS Trigger SOS
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "EMERGENCY UPDATE: sos.location.updated -> 'Заря-4' coordinate drift track updated.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "sos.location.updated",
+                            sos_id: "sos_alert_894",
+                            latitude: 55.7571,
+                            longitude: 37.6180,
+                            status: "active"
+                          })
+                        );
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-yellow-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      WS SOS Drift
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "EMERGENCY RECOVERY: sos.status.changed -> SOS status transitioned to RESOLVED. Back to healthy state.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "sos.status.changed",
+                            sos_id: "sos_alert_894",
+                            status: "resolved"
+                          })
+                        );
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-sky-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      WS Resolve SOS
+                    </button>
+                  </div>
+                </div>
               </div>
 
             </div>

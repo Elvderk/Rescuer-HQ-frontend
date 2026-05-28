@@ -6353,8 +6353,818 @@ class ChatDetailsScreen extends StatelessWidget {
       ),
     );
   }
+ }`
+  },
+  {
+    path: "lib/features/sos/domain/models/sos_alert_model.dart",
+    category: "sos",
+    description: "Production-ready rescue distressed session details, GPS metrics and status bindings.",
+    content: `enum SOSStatus {
+  active,
+  acknowledged,
+  resolving,
+  resolved,
+  falseAlarm
+}
+
+class SOSAlertModel {
+  final String id;
+  final String volunteerId;
+  final String callSign;
+  final double latitude;
+  final double longitude;
+  final int batteryLevel;
+  final String networkState;
+  final SOSStatus status;
+  final String? acousticClipUrl; // voice feedback attachment url
+  final DateTime triggeredAt;
+  final String? acknowledgedByCallSign;
+
+  const SOSAlertModel({
+    required this.id,
+    required this.volunteerId,
+    required this.callSign,
+    required this.latitude,
+    required this.longitude,
+    required this.batteryLevel,
+    required this.networkState,
+    required this.status,
+    this.acousticClipUrl,
+    required this.triggeredAt,
+    this.acknowledgedByCallSign,
+  });
+
+  factory SOSAlertModel.fromJson(Map<String, dynamic> json) {
+    return SOSAlertModel(
+      id: json['id'] as String? ?? '',
+      volunteerId: json['volunteer_id'] as String? ?? '',
+      callSign: json['callsign'] as String? ?? 'Спасатель',
+      latitude: (json['latitude'] as num?)?.toDouble() ?? 55.75,
+      longitude: (json['longitude'] as num?)?.toDouble() ?? 37.61,
+      batteryLevel: json['battery_level'] as int? ?? 100,
+      networkState: json['network_state'] as String? ?? 'OK',
+      status: SOSStatus.values.firstWhere(
+        (e) => e.toString().split('.').last == json['status'],
+        orElse: () => SOSStatus.active,
+      ),
+      acousticClipUrl: json['acoustic_clip_url'] as String?,
+      triggeredAt: json['triggered_at'] != null 
+          ? DateTime.parse(json['triggered_at'] as String)
+          : DateTime.now(),
+      acknowledgedByCallSign: json['acknowledged_by_callsign'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'volunteer_id': volunteerId,
+      'callsign': callSign,
+      'latitude': latitude,
+      'longitude': longitude,
+      'battery_level': batteryLevel,
+      'network_state': networkState,
+      'status': status.toString().split('.').last,
+      'acoustic_clip_url': acousticClipUrl,
+      'triggered_at': triggeredAt.toIso8601String(),
+      'acknowledged_by_callsign': acknowledgedByCallSign,
+    };
+  }
+
+  SOSAlertModel copyWith({
+    String? id,
+    String? volunteerId,
+    String? callSign,
+    double? latitude,
+    double? longitude,
+    int? batteryLevel,
+    String? networkState,
+    SOSStatus? status,
+    String? acousticClipUrl,
+    DateTime? triggeredAt,
+    String? acknowledgedByCallSign,
+  }) {
+    return SOSAlertModel(
+      id: id ?? this.id,
+      volunteerId: volunteerId ?? this.volunteerId,
+      callSign: callSign ?? this.callSign,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
+      batteryLevel: batteryLevel ?? this.batteryLevel,
+      networkState: networkState ?? this.networkState,
+      status: status ?? this.status,
+      acousticClipUrl: acousticClipUrl ?? this.acousticClipUrl,
+      triggeredAt: triggeredAt ?? this.triggeredAt,
+      acknowledgedByCallSign: acknowledgedByCallSign ?? this.acknowledgedByCallSign,
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/sos/data/sos_repository.dart",
+    category: "sos",
+    description: "Emergency SQLite repository backing up safety alert dispatch state and handling reconnect replays.",
+    content: `import 'dart:convert';
+import '../../../core/database/local_database.dart';
+import '../domain/models/sos_alert_model.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/database/daos/sync_dao.dart';
+
+class SOSRepository {
+  final LocalDatabase _localDb;
+  final SyncDao _syncDao;
+  final DioClient _dioClient;
+
+  SOSRepository(this._localDb, this._syncDao, this._dioClient);
+
+  Future<SOSAlertModel?> fetchMyActiveSOS() async {
+    final cached = await _localDb.queryAll('sos_alerts');
+    final active = cached
+        .map((c) => SOSAlertModel.fromJson(c))
+        .where((element) => element.volunteerId == 'vol_44' && element.status == SOSStatus.active)
+        .toList();
+
+    if (active.isNotEmpty) return active.first;
+    return null;
+  }
+
+  Future<void> triggerSOSEmergencyOptimistic(SOSAlertModel alert) async {
+    // Write state to Drift DB instantly
+    await _localDb.insertRecord('sos_alerts', alert.toJson());
+
+    // Enqueue emergency transmission outbox
+    final key = 'sos_trigger_\${alert.id}';
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'sos.created',
+      payloadJson: jsonEncode(alert.toJson()),
+    );
+
+    print('[SOS REPO] SOS Alarm queued with urgency priority!');
+  }
+
+  Future<void> updateSOSStatusOptimistic(String sosId, SOSStatus status, {String? acknowledgedBy}) async {
+    await _localDb.updateRecord('sos_alerts', 'id', sosId, {
+      'status': status.toString().split('.').last,
+      if (acknowledgedBy != null) 'acknowledged_by_callsign': acknowledgedBy,
+    });
+
+    final key = 'sos_status_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {
+      'sos_id': sosId,
+      'status': status.toString().split('.').last,
+      'acknowledged_by_callsign': acknowledgedBy,
+    };
+
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'sos.status.changed',
+      payloadJson: jsonEncode(payload),
+    );
+  }
+
+  Future<void> updateSOSCoordinatesOptimistic(String sosId, double lat, double lng) async {
+    await _localDb.updateRecord('sos_alerts', 'id', sosId, {
+      'latitude': lat,
+      'longitude': lng,
+    });
+
+    final key = 'sos_coord_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {
+      'sos_id': sosId,
+      'latitude': lat,
+      'longitude': lng,
+    };
+
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'sos.location.updated',
+      payloadJson: jsonEncode(payload),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/sos/providers/sos_providers.dart",
+    category: "sos",
+    description: "Tracks active distress states, GPS streams, location permissions verification and WS events.",
+    content: `import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/models/sos_alert_model.dart';
+import '../data/sos_repository.dart';
+import '../../../core/database/local_database.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/services/websocket_event_dispatcher.dart';
+
+final sosRepositoryProvider = Provider<SOSRepository>((ref) {
+  return SOSRepository(LocalDatabase(), ref.watch(syncDaoProvider), ref.watch(dioClientProvider));
+});
+
+// Holds current active SOS alarm from this device (null if healthy state)
+final activeSOSEventProvider = StateNotifierProvider<ActiveSOSNotifier, SOSAlertModel?>((ref) {
+  return ActiveSOSNotifier(ref.watch(sosRepositoryProvider));
+});
+
+class ActiveSOSNotifier extends StateNotifier<SOSAlertModel?> {
+  final SOSRepository _repo;
+
+  ActiveSOSNotifier(this._repo) : super(null) {
+    _init();
+  }
+
+  Future<void> _init() async {
+    final active = await _repo.fetchMyActiveSOS();
+    if (active != null) {
+      state = active;
+    }
+  }
+
+  void setSOS(SOSAlertModel alert) {
+    state = alert;
+    _repo.triggerSOSEmergencyOptimistic(alert);
+  }
+
+  void resolveSOS() {
+    if (state != null) {
+      _repo.updateSOSStatusOptimistic(state!.id, SOSStatus.resolved);
+      state = null;
+    }
+  }
+
+  void updateLocation(double lat, double lng) {
+    if (state != null) {
+      state = state!.copyWith(latitude: lat, longitude: lng);
+      _repo.updateSOSCoordinatesOptimistic(state!.id, lat, lng);
+    }
+  }
+}
+
+// Tracks location collection permissions workflow
+final hasSOSPermissionsProvider = StateProvider<bool>((ref) => true);
+
+// Unified realtime listener for distress updates
+final sosRealtimeListener = Provider<void>((ref) {
+  final dispatcher = ref.watch(webSocketEventDispatcherProvider);
+
+  dispatcher.rawEvents.listen((event) {
+    if (event.eventType == 'sos.created' || event.eventType == 'sos.resolved' || event.eventType == 'sos.status.changed') {
+      print('[WS SOS MSG] Distress operational sync frame arrived: \${event.uuid}');
+      // Trigger update updates to the UI
+      ref.invalidate(activeSOSEventProvider);
+    }
+  });
+});`
+  },
+  {
+    path: "lib/features/sos/presentation/active_sos_screen.dart",
+    category: "sos",
+    description: "Full height high impact alarm panel restricting navigation to focus attention.",
+    content: `import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/sos_providers.dart';
+
+class ActiveSOSScreen extends ConsumerStatefulWidget {
+  const ActiveSOSScreen({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<ActiveSOSScreen> createState() => _ActiveSOSScreenState();
+}
+
+class _ActiveSOSScreenState extends ConsumerState<ActiveSOSScreen> {
+  Timer? _locationTimer;
+  double _mockLat = 55.7562;
+  double _mockLng = 37.6169;
+
+  @override
+  void initState() {
+    super.initState();
+    // Simulate high-frequency background updates (1s) to coordinate search groups
+    _locationTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      _mockLat += 0.0001;
+      _mockLng += 0.0001;
+      ref.read(activeSOSEventProvider.notifier).updateLocation(_mockLat, _mockLng);
+    });
+  }
+
+  @override
+  void dispose() {
+    _locationTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final activeSOS = ref.watch(activeSOSEventProvider);
+
+    return Scaffold(
+      backgroundColor: Colors.red[950],
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Shock header
+              Column(
+                children: [
+                  const SizedBox(height: 20),
+                  const Icon(Icons.warning_amber_rounded, color: Colors.yellowAccent, size: 80),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'РЕЖИМ ЧС АКТИВИРОВАН',
+                    style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Сигнал бедствия транслируется на частоте штаба.',
+                    style: TextStyle(color: Colors.red[100], fontSize: 13),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ),
+
+              // Orbit visualization simulating high freq GPS
+              Center(
+                child: Container(
+                  width: 180,
+                  height: 180,
+                  decoration: BoxDecoration(
+                    color: Colors.red[900],
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.redAccent, width: 4),
+                  ),
+                  child: const Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.gps_fixed, color: Colors.greenAccent, size: 36),
+                        SizedBox(height: 8),
+                        Text('GPS STREAMING', style: TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                        Text('Частота: 1 сек', style: TextStyle(color: Colors.white54, fontSize: 10)),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+              // Emergency stats
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.black26,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.between,
+                      children: [
+                        const Text('Заряд батареи:', style: TextStyle(color: Colors.white70)),
+                        Text('\${activeSOS?.batteryLevel ?? 88}%', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.between,
+                      children: [
+                        const Text('Координаты:', style: TextStyle(color: Colors.white70)),
+                        Text(
+                          '\${activeSOS?.latitude.toStringAsFixed(5) ?? "55.75"}, \${activeSOS?.longitude.toStringAsFixed(5) ?? "37.61"}',
+                          style: const TextStyle(color: Colors.yellowAccent, fontFamily: 'monospace', fontSize: 12),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    const Row(
+                      mainAxisAlignment: MainAxisAlignment.between,
+                      children: [
+                        Text('Запись окружения:', style: TextStyle(color: Colors.white70)),
+                        Text('АКТИВНА🎙️', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
+                      ],
+                    )
+                  ],
+                ),
+              ),
+
+              // Exit / Resolution Button
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.red[950],
+                  minimumSize: const Size.fromHeight(60),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                ),
+                onPressed: () {
+                  ref.read(activeSOSEventProvider.notifier).resolveSOS();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Сигнал бедствия успешно снят. Безопасность восстановлена.')),
+                  );
+                  Navigator.pop(context);
+                },
+                icon: const Icon(Icons.check_circle_outline, size: 28),
+                label: const Text(
+                  'Я В БЕЗОПАСНОСТИ',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/sos/presentation/emergency_tracking_screen.dart",
+    category: "sos",
+    description: "Distress dashboard displaying rescue routes overlays mapped onto tactical GPS boards.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/sos_providers.dart';
+import 'sos_details_screen.dart';
+
+class EmergencyTrackingScreen extends ConsumerWidget {
+  const EmergencyTrackingScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final activeSOS = ref.watch(activeSOSEventProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Карта ЧС Бедствия')),
+      body: Stack(
+        children: [
+          // Geopositional base visual simulation helper
+          Container(
+            color: Colors.slate[900],
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.map, color: Colors.white24, size: 120),
+                  const SizedBox(height: 12),
+                  const Text('ТАКТИЧЕСКИЙ ГИС ОВЕРЛЕЙ SOS', style: TextStyle(color: Colors.white30, fontSize: 13, fontWeight: FontWeight.bold)),
+                  if (activeSOS != null) ...[
+                    const SizedBox(height: 16),
+                    Text(
+                      'Пострадавший: \${activeSOS.callSign}\\nКоординаты: \${activeSOS.latitude.toStringAsFixed(5)}, \${activeSOS.longitude.toStringAsFixed(5)}',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.redAccent, fontFamily: 'monospace', fontSize: 13),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+
+          // Glowing glowing target
+          if (activeSOS != null)
+            Positioned(
+              left: 140,
+              top: 250,
+              child: Container(
+                width: 90,
+                height: 90,
+                decoration: BoxDecoration(
+                  color: Colors.red.withOpacity(0.15),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.red, width: 2),
+                ),
+                child: const Center(
+                  child: Icon(Icons.warning, color: Colors.red, size: 32),
+                ),
+              ),
+            ),
+
+          // Bottom float card
+          Positioned(
+            left: 16,
+            right: 16,
+            bottom: 24,
+            child: Card(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        const CircleAvatar(backgroundColor: Colors.red, child: Icon(Icons.crisis_alert, color: Colors.white)),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(activeSOS?.callSign ?? 'Заря-4 (Иванова)', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                              const Text('Сигнал SOS • Активен', style: TextStyle(color: Colors.red, fontSize: 12, fontWeight: FontWeight.bold)),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.arrow_forward_ios, size: 16),
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (context) => const SOSDetailsScreen()),
+                            );
+                          },
+                        )
+                      ],
+                    ),
+                    const Divider(height: 24),
+                    const Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.directions_run, color: Colors.green),
+                            SizedBox(width: 6),
+                            Text('Экипаж Амур-12:', style: TextStyle(fontSize: 13)),
+                          ],
+                        ),
+                        Text('Дистанция 450м (В пути)', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+                      ],
+                    )
+                  ],
+                ),
+              ),
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/sos/presentation/sos_details_screen.dart",
+    category: "sos",
+    description: "SOS incident auditing detailing logs updates, network stats metrics graphs and acoustical triggers.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/sos_providers.dart';
+
+class SOSDetailsScreen extends ConsumerWidget {
+  const SOSDetailsScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final activeSOS = ref.watch(activeSOSEventProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Журнал аварийного вызова')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          // Basic header card
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.red[50],
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: Colors.red[100]!),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.between,
+                  children: [
+                    Text(
+                      'Сигнал от: \${activeSOS?.callSign ?? "Заря-4"}',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.red[900]),
+                    ),
+                    const Chip(label: Text('АКТИВЕН', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)), backgroundColor: Colors.red),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text('Запущен: \${activeSOS?.triggeredAt.toString() ?? "Только что"}', style: const TextStyle(fontSize: 12)),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          const Text('Координирующие данные', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+          const SizedBox(height: 12),
+          ListTile(
+            title: const Text('Уровень батареи передатчика'),
+            subtitle: Text('\${activeSOS?.batteryLevel ?? 88}%'),
+            leading: const Icon(Icons.battery_alert, color: Colors.orange),
+          ),
+          ListTile(
+            title: const Text('Сенсорный аудиофайл'),
+            subtitle: const Text('Доступна запись окружения (10сек)'),
+            leading: const Icon(Icons.audio_file, color: Colors.indigo),
+            trailing: IconButton(
+              icon: const Icon(Icons.play_circle_fill, size: 32, color: Colors.blueAccent),
+              onPressed: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Воспроизведение аварийного аудиоситуационного файла...')),
+                );
+              },
+            ),
+          ),
+          const Divider(height: 48),
+
+          // Steps list log
+          const Text('Хронология действий (Escalation Log)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+          const SizedBox(height: 12),
+          _buildTimelineStep('12:58', 'Пользователь активировал SOS тревогу (Confirmed Hold).'),
+          _buildTimelineStep('12:58', 'Фоновый трекинг выставил координаты в Drift Outbox.'),
+          _buildTimelineStep('12:59', 'Координатор Амур-12 принял вызов в обработку.'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTimelineStep(String time, String desc) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(time, style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black54)),
+          const SizedBox(width: 16),
+          Expanded(child: Text(desc, style: const TextStyle(fontSize: 13))),
+        ],
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/sos/presentation/widgets/sos_button_widget.dart",
+    category: "sos",
+    description: "Intact long hold trigger used to initiate critical distress operations.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
+import '../../domain/models/sos_alert_model.dart';
+import '../../providers/sos_providers.dart';
+import '../active_sos_screen.dart';
+
+class SOSButtonWidget extends ConsumerStatefulWidget {
+  const SOSButtonWidget({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<SOSButtonWidget> createState() => _SOSButtonWidgetState();
+}
+
+class _SOSButtonWidgetState extends ConsumerState<SOSButtonWidget> {
+  double _progress = 0.0;
+  bool _isHolding = false;
+
+  void _onHoldStart() {
+    setState(() {
+      _isHolding = true;
+      _progress = 0.0;
+    });
+    _tick();
+  }
+
+  void _onHoldEnd() {
+    setState(() {
+      _isHolding = false;
+      _progress = 0.0;
+    });
+  }
+
+  void _tick() {
+    if (!_isHolding) return;
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (!mounted || !_isHolding) return;
+      setState(() {
+        _progress += 0.05;
+        if (_progress >= 1.0) {
+          _progress = 1.0;
+          _isHolding = false;
+          _dispatchSOSAlert();
+        } else {
+          _tick();
+        }
+      });
+    });
+  }
+
+  void _dispatchSOSAlert() {
+    final alert = SOSAlertModel(
+      id: const Uuid().v4(),
+      volunteerId: 'vol_44',
+      callSign: 'Заря-4 (Иванова)',
+      latitude: 55.7562,
+      longitude: 37.6169,
+      batteryLevel: 88,
+      networkState: 'OK',
+      status: SOSStatus.active,
+      triggeredAt: DateTime.now(),
+    );
+
+    ref.read(activeSOSEventProvider.notifier).setSOS(alert);
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const ActiveSOSScreen()),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onLongPressStart: (_) => _onHoldStart(),
+      onLongPressEnd: (_) => _onHoldEnd(),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+        decoration: BoxDecoration(
+          color: _isHolding ? Colors.redAccent.withOpacity(0.2) : Colors.red[50],
+          border: Border.all(color: Colors.red[200]!),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Stack(
+              alignment: Alignment.center,
+              children: [
+                SizedBox(
+                  width: 48,
+                  height: 48,
+                  child: CircularProgressIndicator(
+                    value: _progress,
+                    backgroundColor: Colors.red[100],
+                    color: Colors.redAccent,
+                    strokeWidth: 4,
+                  ),
+                ),
+                Icon(Icons.sos, color: Colors.red[900], size: 24),
+              ],
+            ),
+            const SizedBox(width: 16),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('ТРЕВОГА SOS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.red)),
+                Text(
+                  _isHolding ? 'Удерживайте кнопку спасения...' : 'Зажмите на 3 сек для вызова SOS',
+                  style: TextStyle(fontSize: 11, color: Colors.slate[750]),
+                ),
+              ],
+            )
+          ],
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/sos/presentation/widgets/emergency_confirmation_dialog.dart",
+    category: "sos",
+    description: "Guard validation modal prevent random SOS signals triggering.",
+    content: `import 'package:flutter/material.dart';
+
+class EmergencyConfirmationDialog extends StatelessWidget {
+  final VoidCallback onConfirmed;
+
+  const EmergencyConfirmationDialog({Key? key, required this.onConfirmed}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.dangerous, color: Colors.orange),
+          SizedBox(width: 8),
+          Text('Подтверждение SOS'),
+        ],
+      ),
+      content: const Text(
+        'Внимание! Сигнал тревоги экстренно прекратит обычный сеанс работы и мобилизует все силы отряда. Вы уверены, что вашей жизни угрожает опасность?',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('ОТМЕНА'),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+          onPressed: () {
+            Navigator.pop(context);
+            onConfirmed();
+          },
+          child: const Text('АКТИВИРОВАТЬ SOS', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        )
+      ],
+    );
+  }
 }`
   }
 ];
+
 
 
