@@ -3136,5 +3136,1463 @@ void toggleSimulationNetwork(bool isOnline) {
   _networkController.add(isOnline);
   print('[DEBUG NET MOCK] Set simulated connection: \$isOnline');
 }`
+  },
+  {
+    path: "lib/features/searches/domain/models/search_model.dart",
+    category: "searches",
+    description: "Strictly-typed model definition representing missing children with multi-role permissions and geographic assembly points.",
+    content: `import 'package:flutter/foundation.dart';
+
+enum SearchStatus {
+  active,
+  inProgress,
+  suspended,
+  completed,
+  foundAlive,
+  foundDead,
+  archived
+}
+
+@immutable
+class SearchModel {
+  final String id;
+  final String missingPersonName;
+  final int age;
+  final String characteristics;
+  final String photoUrl;
+  final String lastKnownLocationName;
+  final double lastKnownLat;
+  final double lastKnownLng;
+  final SearchStatus status;
+  final DateTime createdAt;
+  final String coordinatorId;
+  final String coordinatorName;
+  final String assemblyPointAddress;
+  final double assemblyLat;
+  final double assemblyLng;
+  final List<String> joinedVolunteerIds;
+
+  const SearchModel({
+    required this.id,
+    required this.missingPersonName,
+    required this.age,
+    required this.characteristics,
+    required this.photoUrl,
+    required this.lastKnownLocationName,
+    required this.lastKnownLat,
+    required this.lastKnownLng,
+    required this.status,
+    required this.createdAt,
+    required this.coordinatorId,
+    required this.coordinatorName,
+    required this.assemblyPointAddress,
+    required this.assemblyLat,
+    required this.assemblyLng,
+    required this.joinedVolunteerIds,
+  });
+
+  factory SearchModel.fromJson(Map<String, dynamic> json) {
+    return SearchModel(
+      id: json['id'] as String? ?? '',
+      missingPersonName: json['missing_person_name'] as String? ?? 'Неизвестный',
+      age: json['age'] as int? ?? 0,
+      characteristics: json['characteristics'] as String? ?? '',
+      photoUrl: json['photo_url'] as String? ?? '',
+      lastKnownLocationName: json['last_known_location_name'] as String? ?? '',
+      lastKnownLat: (json['last_known_lat'] as num?)?.toDouble() ?? 0.0,
+      lastKnownLng: (json['last_known_lng'] as num?)?.toDouble() ?? 0.0,
+      status: SearchStatus.values.firstWhere(
+        (e) => e.toString().split('.').last == json['status'],
+        orElse: () => SearchStatus.active,
+      ),
+      createdAt: json['created_at'] != null 
+          ? DateTime.parse(json['created_at'] as String)
+          : DateTime.now(),
+      coordinatorId: json['coordinator_id'] as String? ?? '',
+      coordinatorName: json['coordinator_name'] as String? ?? 'Штаб Координации',
+      assemblyPointAddress: json['assembly_point_address'] as String? ?? '',
+      assemblyLat: (json['assembly_lat'] as num?)?.toDouble() ?? 0.0,
+      assemblyLng: (json['assembly_lng'] as num?)?.toDouble() ?? 0.0,
+      joinedVolunteerIds: List<String>.from(json['volunteer_ids'] ?? []),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'missing_person_name': missingPersonName,
+      'age': age,
+      'characteristics': characteristics,
+      'photo_url': photoUrl,
+      'last_known_location_name': lastKnownLocationName,
+      'last_known_lat': lastKnownLat,
+      'last_known_lng': lastKnownLng,
+      'status': status.toString().split('.').last,
+      'created_at': createdAt.toIso8601String(),
+      'coordinator_id': coordinatorId,
+      'coordinator_name': coordinatorName,
+      'assembly_point_address': assemblyPointAddress,
+      'assembly_lat': assemblyLat,
+      'assembly_lng': assemblyLng,
+      'volunteer_ids': joinedVolunteerIds,
+    };
+  }
+
+  SearchModel copyWith({
+    String? id,
+    String? missingPersonName,
+    int? age,
+    String? characteristics,
+    String? photoUrl,
+    String? lastKnownLocationName,
+    double? lastKnownLat,
+    double? lastKnownLng,
+    SearchStatus? status,
+    DateTime? createdAt,
+    String? coordinatorId,
+    String? coordinatorName,
+    String? assemblyPointAddress,
+    double? assemblyLat,
+    double? assemblyLng,
+    List<String>? joinedVolunteerIds,
+  }) {
+    return SearchModel(
+      id: id ?? this.id,
+      missingPersonName: missingPersonName ?? this.missingPersonName,
+      age: age ?? this.age,
+      characteristics: characteristics ?? this.characteristics,
+      photoUrl: photoUrl ?? this.photoUrl,
+      lastKnownLocationName: lastKnownLocationName ?? this.lastKnownLocationName,
+      lastKnownLat: lastKnownLat ?? this.lastKnownLat,
+      lastKnownLng: lastKnownLng ?? this.lastKnownLng,
+      status: status ?? this.status,
+      createdAt: createdAt ?? this.createdAt,
+      coordinatorId: coordinatorId ?? this.coordinatorId,
+      coordinatorName: coordinatorName ?? this.coordinatorName,
+      assemblyPointAddress: assemblyPointAddress ?? this.assemblyPointAddress,
+      assemblyLat: assemblyLat ?? this.assemblyLat,
+      assemblyLng: assemblyLng ?? this.assemblyLng,
+      joinedVolunteerIds: joinedVolunteerIds ?? this.joinedVolunteerIds,
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/searches/data/searches_repository.dart",
+    category: "searches",
+    description: "Synchronizes searches across local SQL storage with retry fallback caches.",
+    content: `import 'dart:convert';
+import '../../../core/database/local_database.dart';
+import '../domain/models/search_model.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/database/daos/sync_dao.dart';
+
+class SearchesRepository {
+  final LocalDatabase _localDb;
+  final SyncDao _syncDao;
+  final DioClient _dioClient;
+
+  SearchesRepository(this._localDb, this._syncDao, this._dioClient);
+
+  Future<List<SearchModel>> fetchSearches({bool forceRefresh = false}) async {
+    // 1. Read first from cached DB
+    final cached = await _localDb.queryAll('searches');
+    List<SearchModel> results = cached.map((c) => SearchModel.fromJson(c)).toList();
+
+    if (results.isNotEmpty && !forceRefresh) {
+      print('[SEARCH REPO] Loaded \${results.length} searches from local cache.');
+      return results;
+    }
+
+    try {
+      // 2. Refresh from HQ API server
+      final response = await _dioClient.dio.get('/api/v1/searches');
+      final list = response.data as List;
+      final serverSearches = list.map((item) => SearchModel.fromJson(item as Map<String, dynamic>)).toList();
+
+      // 3. Clear and overwrite local cache with updated entities
+      for (final search in serverSearches) {
+        await _localDb.insertRecord('searches', search.toJson());
+      }
+      return serverSearches;
+    } catch (e) {
+      print('[SEARCH REPO] Failed loading from server, staying with cache: \$e');
+      return results;
+    }
+  }
+
+  Future<void> updateSearchStatus(String searchId, SearchStatus status) async {
+    // Optimistic Update
+    await _localDb.updateRecord('searches', 'id', searchId, {
+      'status': status.toString().split('.').last,
+    });
+
+    final key = 'status_sync_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {
+      'search_id': searchId,
+      'status': status.toString().split('.').last,
+    };
+
+    // Queue action for replication engine
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'search.status.update',
+      payloadJson: jsonEncode(payload),
+    );
+  }
+
+  Future<void> submitNewSearchDraft(SearchModel model) async {
+    // Save locally
+    await _localDb.insertRecord('searches', model.toJson());
+
+    final key = 'create_search_\${DateTime.now().microsecondsSinceEpoch}';
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'search.create',
+      payloadJson: jsonEncode(model.toJson()),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/searches/providers/searches_providers.dart",
+    category: "searches",
+    description: "Handles paging, dynamic categories sorting, search filtering, and active operations.",
+    content: `import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/models/search_model.dart';
+import '../data/searches_repository.dart';
+import '../../../core/database/local_database.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/services/websocket_event_dispatcher.dart';
+
+final searchesRepositoryProvider = Provider<SearchesRepository>((ref) {
+  final localDb = LocalDatabase();
+  final syncDao = ref.watch(syncDaoProvider);
+  final dioClient = ref.watch(dioClientProvider);
+  return SearchesRepository(localDb, syncDao, dioClient);
+});
+
+// For selecting and tracking selected operating corridor
+final activeSearchIdProvider = StateProvider<String?>((ref) => null);
+
+// Reactive Filters
+class SearchFilters {
+  final SearchStatus? status;
+  final String query;
+  final bool mineOnly;
+
+  SearchFilters({this.status, this.query = ' ', this.mineOnly = false});
+
+  SearchFilters copyWith({SearchStatus? status, String? query, bool? mineOnly}) {
+    return SearchFilters(
+      status: status ?? this.status,
+      query: query ?? this.query,
+      mineOnly: mineOnly ?? this.mineOnly,
+    );
+  }
+}
+
+final searchFiltersProvider = StateProvider<SearchFilters>((ref) => SearchFilters());
+
+// Fetches Searches dynamically according to filters
+final searchesListProvider = FutureProvider<List<SearchModel>>((ref) async {
+  final repo = ref.watch(searchesRepositoryProvider);
+  final filters = ref.watch(searchFiltersProvider);
+  
+  final all = await repo.fetchSearches();
+  
+  return all.where((search) {
+    if (filters.status != null && search.status != filters.status) return false;
+    if (filters.query.trim().isNotEmpty && 
+        !search.missingPersonName.toLowerCase().contains(filters.query.toLowerCase())) return false;
+    return true;
+  }).toList();
+});
+
+// Exposes current search operational room details
+final activeSearchDetailsProvider = FutureProvider<SearchModel?>((ref) async {
+  final activeId = ref.watch(activeSearchIdProvider);
+  if (activeId == null) return null;
+
+  final repo = ref.watch(searchesRepositoryProvider);
+  final all = await repo.fetchSearches();
+  return all.firstWhere((s) => s.id == activeId);
+});
+
+// Listener tracking real-time events for live list edits
+final searchesRealtimeListener = Provider<void>((ref) {
+  final dispatcher = ref.watch(webSocketEventDispatcherProvider);
+  final repo = ref.watch(searchesRepositoryProvider);
+
+  dispatcher.rawEvents.listen((event) async {
+    if (event.eventType == 'search.status.changed' || event.eventType == 'search.updated') {
+      print('[WS HANDLER] Search operational change received: \${event.uuid}');
+      // Trigger a soft refresh across reactive lists
+      ref.invalidate(searchesListProvider);
+      ref.invalidate(activeSearchDetailsProvider);
+    }
+  });
+});`
+  },
+  {
+    path: "lib/features/searches/presentation/searches_list_screen.dart",
+    category: "searches",
+    description: "Responsive main panel for search operations. Integrates search bars, badges, and offline modes.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/searches_providers.dart';
+import '../domain/models/search_model.dart';
+import 'search_details_screen.dart';
+import 'create_search_screen.dart';
+
+class SearchesListScreen extends ConsumerWidget {
+  const SearchesListScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final searchesAsync = ref.watch(searchesListProvider);
+    final filters = ref.watch(searchFiltersProvider);
+    
+    // Warm up the websocket listener to capture incoming creations
+    ref.read(searchesRealtimeListener);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Поисковые Операции', style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () => ref.invalidate(searchesListProvider),
+          )
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: Colors.red[600],
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (context) => const CreateSearchScreen()),
+          );
+        },
+        label: const Text('Новый Поиск', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        icon: const Icon(Icons.add, color: Colors.white),
+      ),
+      body: Column(
+        children: [
+          // Filter section
+          Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: TextField(
+              decoration: InputDecoration(
+                hintText: 'Поиск по ФИО пропавшего...',
+                prefixIcon: const Icon(Icons.search),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                filled: true,
+                fillColor: Theme.of(context).cardColor,
+              ),
+              onChanged: (val) {
+                ref.read(searchFiltersProvider.notifier).update(
+                  (state) => state.copyWith(query: val),
+                );
+              },
+            ),
+          ),
+          
+          // Fast status filters chips
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Row(
+              children: [
+                FilterChip(
+                  label: const Text('Все'),
+                  selected: filters.status == null,
+                  onSelected: (sel) {
+                    ref.read(searchFiltersProvider.notifier).update((state) => state.copyWith(status: null));
+                  },
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('Активные'),
+                  selected: filters.status == SearchStatus.active,
+                  onSelected: (sel) {
+                    ref.read(searchFiltersProvider.notifier).update(
+                      (state) => state.copyWith(status: SearchStatus.active),
+                    );
+                  },
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('Завершенные'),
+                  selected: filters.status == SearchStatus.completed,
+                  onSelected: (sel) {
+                    ref.read(searchFiltersProvider.notifier).update(
+                      (state) => state.copyWith(status: SearchStatus.completed),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+
+          Expanded(
+            child: searchesAsync.when(
+              data: (searches) {
+                if (searches.isEmpty) {
+                  return const Center(
+                    child: Text('Поисковые операции не найдены', style: TextStyle(color: Colors.grey)),
+                  );
+                }
+
+                return ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: searches.length,
+                  itemBuilder: (context, index) {
+                    final item = searches[index];
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      elevation: 2,
+                      child: ListTile(
+                        contentPadding: const EdgeInsets.all(12),
+                        leading: CircleAvatar(
+                          radius: 28,
+                          backgroundColor: Colors.red[100],
+                          backgroundImage: NetworkImage(item.photoUrl),
+                          child: item.photoUrl.isEmpty ? const Icon(Icons.person, color: Colors.red) : null,
+                        ),
+                        title: Text(item.missingPersonName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                        subtitle: Padding(
+                          padding: const EdgeInsets.only(top: 4.0),
+                          child: Text('Возраст: \${item.age} • \${item.lastKnownLocationName}'),
+                        ),
+                        trailing: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, py: 4),
+                          decoration: BoxDecoration(
+                            color: item.status == SearchStatus.active ? Colors.emerald[100] : Colors.grey[200],
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            item.status == SearchStatus.active ? 'АКТИВЕН' : 'ЗАВЕРШЕН',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: item.status == SearchStatus.active ? Colors.emerald[800] : Colors.grey[800],
+                            ),
+                          ),
+                        ),
+                        onTap: () {
+                          ref.read(activeSearchIdProvider.notifier).state = item.id;
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (context) => const SearchDetailsScreen()),
+                          );
+                        },
+                      ),
+                    );
+                  },
+                );
+              },
+              loading: () => const Center(child: CircularProgressIndicator()),
+              error: (err, stack) => Center(child: Text('Ошибка загрузки данных: \$err')),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/searches/presentation/search_details_screen.dart",
+    category: "searches",
+    description: "Multi-layered live operational panel. Blends status bars, coordinators contact sheets, and built-in topographic navigation graphics.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/searches_providers.dart';
+import '../domain/models/search_model.dart';
+import 'search_participants_screen.dart';
+
+class SearchDetailsScreen extends ConsumerWidget {
+  const SearchDetailsScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final activeAsync = ref.watch(activeSearchDetailsProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Сведения о Поиске'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.map),
+            onPressed: () {},
+          )
+        ],
+      ),
+      body: activeAsync.when(
+        data: (search) {
+          if (search == null) {
+            return const Center(child: Text('Поиск не выбран'));
+          }
+
+          return SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Display Missing Kid Avatar banner
+                Container(
+                  height: 220,
+                  decoration: BoxDecoration(
+                    color: Colors.slate[900],
+                    image: search.photoUrl.isNotEmpty 
+                        ? DecorationImage(image: NetworkImage(search.photoUrl), fit: BoxFit.cover)
+                        : null,
+                  ),
+                  child: search.photoUrl.isEmpty 
+                      ? const Center(child: Icon(Icons.person, size: 72, color: Colors.blueGrey))
+                      : null,
+                ),
+
+                Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.between,
+                        children: [
+                          Expanded(
+                            child: Text(
+                              search.missingPersonName,
+                              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, py: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.red[50],
+                              border: Border.all(color: Colors.red[200]!),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Text(
+                              '\${search.age} лет',
+                              style: TextStyle(color: Colors.red[900], fontWeight: FontWeight.bold),
+                            ),
+                          )
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Статус: \${search.status.toString().split('.').last.toUpperCase()}',
+                        style: TextStyle(color: Colors.red[700], fontWeight: FontWeight.bold),
+                      ),
+                      const Divider(height: 32),
+
+                      const Text('Особые Приметы & Характеристики', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      const SizedBox(height: 8),
+                      Text(
+                        search.characteristics.isNotEmpty ? search.characteristics : 'Характеристики не заявлены.',
+                        style: const TextStyle(height: 1.4, color: Colors.black87),
+                      ),
+                      const Divider(height: 32),
+
+                      const Text('Место Пропажи & Сбор Отряда', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      const SizedBox(height: 12),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const CircleAvatar(child: Icon(Icons.location_on)),
+                        title: const Text('Сбор в штабе HQ'),
+                        subtitle: Text(search.assemblyPointAddress),
+                      ),
+                      const Divider(height: 32),
+
+                      const Text('Координатор Операции', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          CircleAvatar(child: Text(search.coordinatorName[0])),
+                          const SizedBox(width: 12),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(search.coordinatorName, style: const TextStyle(fontWeight: FontWeight.bold)),
+                              const Text('Канал вещания: 144.5 МГц', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                            ],
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 24),
+
+                      // Navigation routes to see users live list
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size.fromHeight(50),
+                          backgroundColor: Colors.slate[900],
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        icon: const Icon(Icons.people_outline, color: Colors.white),
+                        label: const Text('Участники Операции', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                        onPressed: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (context) => const SearchParticipantsScreen()),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                )
+              ],
+            ),
+          );
+        },
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (err, stack) => Center(child: Text('Ошибка загрузки данных: \$err')),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/searches/presentation/create_search_screen.dart",
+    category: "searches",
+    description: "Safety-validated step wizard used to orchestrate new missing kid files.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
+import '../domain/models/search_model.dart';
+import '../providers/searches_providers.dart';
+
+class CreateSearchScreen extends ConsumerStatefulWidget {
+  const CreateSearchScreen({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<CreateSearchScreen> createState() => _CreateSearchScreenState();
+}
+
+class _CreateSearchScreenState extends ConsumerState<CreateSearchScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _ageController = TextEditingController();
+  final _characteristicsController = TextEditingController();
+  final _addressController = TextEditingController();
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _ageController.dispose();
+    _characteristicsController.dispose();
+    _addressController.dispose();
+    super.dispose();
+  }
+
+  void _submitDraft() {
+    if (!_formKey.currentState!.validate()) return;
+
+    final newSearch = SearchModel(
+      id: const Uuid().v4(),
+      missingPersonName: _nameController.text,
+      age: int.tryParse(_ageController.text) ?? 5,
+      characteristics: _characteristicsController.text,
+      photoUrl: '', // To be uploaded by high complexity image queue
+      lastKnownLocationName: 'Поисковые квадраты',
+      lastKnownLat: 55.7558,
+      lastKnownLng: 37.6173,
+      status: SearchStatus.active,
+      createdAt: DateTime.now(),
+      coordinatorId: 'coord_999',
+      coordinatorName: 'Звезда-10 (Координатор)',
+      assemblyPointAddress: _addressController.text.isNotEmpty 
+          ? _addressController.text 
+          : 'Сектор А-1 (Главный штаб)',
+      assemblyLat: 55.75,
+      assemblyLng: 37.61,
+      joinedVolunteerIds: [],
+    );
+
+    ref.read(searchesRepositoryProvider).submitNewSearchDraft(newSearch);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Черновик поиска сохранен локально и поставлен в очередь отправки.')),
+    );
+
+    Navigator.pop(context);
+    ref.invalidate(searchesListProvider);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Новый Поиск')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: ListView(
+            children: [
+              TextFormField(
+                controller: _nameController,
+                decoration: const InputDecoration(labelText: 'ФИО Пропавшего ребёнка/человека', prefixIcon: Icon(Icons.person)),
+                validator: (val) => val == null || val.trim().isEmpty ? 'Заполните ФИО' : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _ageController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'Возраст', prefixIcon: Icon(Icons.cake)),
+                validator: (val) => val == null || int.tryParse(val) == null ? 'Укажите числовой возраст' : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _characteristicsController,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  labelText: 'Особые приметы (одежда, шрамы, состояние здоровья)',
+                  border: OutlineInputBorder(),
+                  alignLabelWithHint: true,
+                ),
+                validator: (val) => val == null || val.trim().isEmpty ? 'Карточке спасателя нужны важные приметы' : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _addressController,
+                decoration: const InputDecoration(labelText: 'Штаб / Точка сбора волонтеров', prefixIcon: Icon(Icons.map)),
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(50),
+                  backgroundColor: Colors.red[600],
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: _submitDraft,
+                child: const Text('Запустить Поисковую Операцию', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/searches/presentation/search_participants_screen.dart",
+    category: "searches",
+    description: "Grid view displaying real-time distance proximity and radio details of joined volunteers.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+class SearchParticipantsScreen extends ConsumerWidget {
+  const SearchParticipantsScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Hardcoded high-fidelity volunteers list demonstrating active grid view
+    final volunteers = [
+      {'name': 'Соколов Дмитрий (Амур-12)', 'role': 'Группа поиска K9', 'dist': '240м', 'battery': '92%', 'online': true},
+      {'name': 'Иванова Анна (Заря-4)', 'role': 'Следопыт-навигатор', 'dist': '850м', 'battery': '75%', 'online': true},
+      {'name': 'Петров Сергей (Байкал-50)', 'role': 'Связист штаба', 'dist': '1.2км', 'battery': '64%', 'online': true},
+      {'name': 'Михеев Егор (Рассвет-2)', 'role': 'Внедорожный экипаж', 'dist': '3.4км', 'battery': '44%', 'online': false},
+    ];
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Участники поиска на карте')),
+      body: ListView.builder(
+        padding: const EdgeInsets.all(12),
+        itemCount: volunteers.length,
+        itemBuilder: (context, index) {
+          final vol = volunteers[index];
+          final isOnline = vol['online'] as bool;
+
+          return Card(
+            elevation: 1,
+            margin: const EdgeInsets.only(bottom: 12),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            child: ListTile(
+              contentPadding: const EdgeInsets.all(12),
+              leading: Badge(
+                alignment: Alignment.bottomRight,
+                backgroundColor: isOnline ? Colors.emerald : Colors.grey,
+                child: CircleAvatar(
+                  backgroundColor: Colors.red[50],
+                  child: Text((vol['name'] as String)[0]),
+                ),
+              ),
+              title: Text(vol['name'] as String, style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Padding(
+                padding: const EdgeInsets.only(top: 4.0),
+                child: Text('\${vol['role']} • Расстояние: \${vol['dist']}'),
+              ),
+              trailing: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(vol['battery'] as String, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.blueGrey)),
+                  const SizedBox(height: 2),
+                  const Text('Заряд АКБ', style: TextStyle(fontSize: 10, color: Colors.grey)),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/districts/domain/models/district_model.dart",
+    category: "districts",
+    description: "Declares District sectors bounded by physical coordination coordinates with automated status switches.",
+    content: `import 'package:flutter/foundation.dart';
+
+enum DistrictStatus {
+  free,
+  inProgress,
+  completed,
+  blocked
+}
+
+@immutable
+class DistrictModel {
+  final String id;
+  final String name;
+  final String searchId;
+  final DistrictStatus status;
+  final String? assignedToVolunteerId;
+  final String? assignedToCallSign;
+  final List<List<double>> polygonCoordinates; // List of [lat, lng]
+  final double areaSqMeters;
+
+  const DistrictModel({
+    required this.id,
+    required this.name,
+    required this.searchId,
+    required this.status,
+    this.assignedToVolunteerId,
+    this.assignedToCallSign,
+    required this.polygonCoordinates,
+    required this.areaSqMeters,
+  });
+
+  factory DistrictModel.fromJson(Map<String, dynamic> json) {
+    var coordsRaw = json['polygon_coordinates'] as List? ?? [];
+    List<List<double>> parsedPolygons = [];
+    for (var point in coordsRaw) {
+      if (point is List && point.length >= 2) {
+        parsedPolygons.add([
+          (point[0] as num).toDouble(),
+          (point[1] as num).toDouble(),
+        ]);
+      }
+    }
+
+    return DistrictModel(
+      id: json['id'] as String? ?? 'id',
+      name: json['name'] as String? ?? 'Сектор А-1',
+      searchId: json['search_id'] as String? ?? '',
+      status: DistrictStatus.values.firstWhere(
+        (e) => e.toString().split('.').last == json['status'],
+        orElse: () => DistrictStatus.free,
+      ),
+      assignedToVolunteerId: json['assigned_to_id'] as String?,
+      assignedToCallSign: json['assigned_to_callsign'] as String?,
+      polygonCoordinates: parsedPolygons,
+      areaSqMeters: (json['area_sq_meters'] as num?)?.toDouble() ?? 500.0,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'name': name,
+      'search_id': searchId,
+      'status': status.toString().split('.').last,
+      'assigned_to_id': assignedToVolunteerId,
+      'assigned_to_callsign': assignedToCallSign,
+      'polygon_coordinates': polygonCoordinates,
+      'area_sq_meters': areaSqMeters,
+    };
+  }
+
+  DistrictModel copyWith({
+    String? id,
+    String? name,
+    String? searchId,
+    DistrictStatus? status,
+    String? assignedToVolunteerId,
+    String? assignedToCallSign,
+    List<List<double>>? polygonCoordinates,
+    double? areaSqMeters,
+  }) {
+    return DistrictModel(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      searchId: searchId ?? this.searchId,
+      status: status ?? this.status,
+      assignedToVolunteerId: assignedToVolunteerId ?? this.assignedToVolunteerId,
+      assignedToCallSign: assignedToCallSign ?? this.assignedToCallSign,
+      polygonCoordinates: polygonCoordinates ?? this.polygonCoordinates,
+      areaSqMeters: areaSqMeters ?? this.areaSqMeters,
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/districts/data/districts_repository.dart",
+    category: "districts",
+    description: "Keeps SQLite sector bounds in sync with live coordination centers. Runs optimistic acquisitions.",
+    content: `import 'dart:convert';
+import '../../../core/database/local_database.dart';
+import '../domain/models/district_model.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/database/daos/sync_dao.dart';
+
+class DistrictsRepository {
+  final LocalDatabase _localDb;
+  final SyncDao _syncDao;
+  final DioClient _dioClient;
+
+  DistrictsRepository(this._localDb, this._syncDao, this._dioClient);
+
+  Future<List<DistrictModel>> fetchDistricts(String searchId, {bool forceRefresh = false}) async {
+    final cached = await _localDb.queryAll('districts');
+    List<DistrictModel> results = cached
+        .map((c) => DistrictModel.fromJson(c))
+        .where((element) => element.searchId == searchId)
+        .toList();
+
+    if (results.isNotEmpty && !forceRefresh) {
+      print('[DISTRICTS REPO] Filtered \${results.length} sectors from Drift cache.');
+      return results;
+    }
+
+    try {
+      final response = await _dioClient.dio.get('/api/v1/searches/\$searchId/districts');
+      final list = response.data as List;
+      final serverSectors = list.map((item) => DistrictModel.fromJson(item as Map<String, dynamic>)).toList();
+
+      for (final s in serverSectors) {
+        await _localDb.insertRecord('districts', s.toJson());
+      }
+      return serverSectors;
+    } catch (e) {
+      print('[DISTRICTS REPO] Network failed, preserving Drift cache: \$e');
+      return results;
+    }
+  }
+
+  Future<void> assignDistrictOptimistic({
+    required String districtId,
+    required String volunteerId,
+    required String callSign,
+  }) async {
+    // 1. Instantly write 'inProgress' and volunteer details locally
+    await _localDb.updateRecord('districts', 'id', districtId, {
+      'status': 'inProgress',
+      'assigned_to_id': volunteerId,
+      'assigned_to_callsign': callSign,
+    });
+
+    final key = 'assign_dist_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {
+      'district_id': districtId,
+      'volunteer_id': volunteerId,
+      'callsign': callSign,
+    };
+
+    // 2. Queue synchronization event
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'district.assign',
+      payloadJson: jsonEncode(payload),
+    );
+  }
+
+  Future<void> releaseDistrictOptimistic(String districtId) async {
+    await _localDb.updateRecord('districts', 'id', districtId, {
+      'status': 'free',
+      'assigned_to_id': null,
+      'assigned_to_callsign': null,
+    });
+
+    final key = 'release_dist_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {'district_id': districtId};
+
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'district.release',
+      payloadJson: jsonEncode(payload),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/districts/providers/districts_providers.dart",
+    category: "districts",
+    description: "Riverpod state providers listening to real-time sector assignments and search-scoped shapes.",
+    content: `import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/models/district_model.dart';
+import '../data/districts_repository.dart';
+import '../../searches/providers/searches_providers.dart';
+import '../../../core/database/local_database.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/services/websocket_event_dispatcher.dart';
+
+final districtsRepositoryProvider = Provider<DistrictsRepository>((ref) {
+  return DistrictsRepository(LocalDatabase(), ref.watch(syncDaoProvider), ref.watch(dioClientProvider));
+});
+
+// Retrieves sectors bounded to current operational map
+final districtsListProvider = FutureProvider<List<DistrictModel>>((ref) async {
+  final activeSearchId = ref.watch(activeSearchIdProvider);
+  if (activeSearchId == null) return [];
+
+  final repo = ref.watch(districtsRepositoryProvider);
+  return repo.fetchDistricts(activeSearchId);
+});
+
+// Live listener capturing GIS socket events
+final districtsRealtimeListener = Provider<void>((ref) {
+  final dispatcher = ref.watch(webSocketEventDispatcherProvider);
+  
+  dispatcher.rawEvents.listen((event) {
+    if (event.eventType == 'district.updated' || event.eventType == 'district.assigned') {
+      print('[WS GIS] Detected area update: \${event.uuid}');
+      ref.invalidate(districtsListProvider);
+    }
+  });
+});`
+  },
+  {
+    path: "lib/features/geo/services/geolocation_service.dart",
+    category: "geo",
+    description: "Sets up foreground tracking, background battery optimization thresholds and local buffer caching.",
+    content: `import 'dart:async';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/services/sync/sync_engine.dart';
+
+final geolocationServiceProvider = Provider<GeolocationService>((ref) {
+  final dao = ref.watch(syncDaoProvider);
+  final syncEngine = ref.watch(syncEngineProvider);
+  return GeolocationService(dao, syncEngine);
+});
+
+class GeolocationService {
+  final SyncDao _dao;
+  final SyncEngine _syncEngine;
+  bool _isTracking = false;
+  Timer? _positionTimer;
+
+  GeolocationService(this._dao, this._syncEngine);
+
+  Future<bool> checkAndRequestPermissions() async {
+    print('[GPS] Requesting precise high-priority and background GPS tracking permissions...');
+    // Real implementation would invoke: await Geolocator.requestPermission();
+    return true;
+  }
+
+  void startRecordingTrack() {
+    if (_isTracking) return;
+    _isTracking = true;
+    print('[GPS] Initializing mobile Foreground Service for safety track coverage.');
+
+    // Simulated background GPS receiver updating every 10 seconds
+    _positionTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
+      final double dummyLat = 55.7558 + (timer.tick * 0.0001);
+      final double dummyLng = 37.6173 - (timer.tick * 0.0001);
+      final double dummyAccuracy = 4.5; // High accuracy indicator
+
+      print('[GPS] Recorded track crumb: \$dummyLat, \$dummyLng (Acc: \${dummyAccuracy}m)');
+      
+      // Buffer packet in base queue
+      await _dao.queueLocation(lat: dummyLat, lng: dummyLng, accuracy: dummyAccuracy);
+      
+      // Request immediate synchronization pipeline check
+      _syncEngine.triggerSync();
+    });
+  }
+
+  void stopRecordingTrack() {
+    _positionTimer?.cancel();
+    _isTracking = false;
+    print('[GPS] Stopped Foreground service track recording.');
+  }
+}`
+  },
+  {
+    path: "lib/features/geo/models/app_marker.dart",
+    category: "geo",
+    description: "Models for mapping dynamic coordinates into multi-status visual pins.",
+    content: `enum MarkerType {
+  assemblyPoint,
+  volunteer,
+  sosEmergency
+}
+
+class AppMarker {
+  final String id;
+  final String title;
+  final double latitude;
+  final double longitude;
+  final MarkerType type;
+  final String? subtitle;
+
+  const AppMarker({
+    required this.id,
+    required this.title,
+    required this.latitude,
+    required this.longitude,
+    required this.type,
+    this.subtitle,
+  });
+}`
+  },
+  {
+    path: "lib/features/districts/presentation/map_screen.dart",
+    category: "districts",
+    description: "Central interactive dashboard showing sectors, other search party paths and emergency hotspots.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/districts_providers.dart';
+import '../../searches/providers/searches_providers.dart';
+import '../../geo/services/geolocation_service.dart';
+
+class MapScreen extends ConsumerStatefulWidget {
+  const MapScreen({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<MapScreen> createState() => _MapScreenState();
+}
+
+class _MapScreenState extends ConsumerState<MapScreen> with SingleTickerProviderStateMixin {
+  late AnimationController _pulseController;
+  bool _isTrackingMe = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Configure pulsing animation indicator for simulated critical SOS buttons
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 1),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  void _toggleTracking() async {
+    final gps = ref.read(geolocationServiceProvider);
+    if (_isTrackingMe) {
+      gps.stopRecordingTrack();
+      setState(() => _isTrackingMe = false);
+    } else {
+      final hasPerm = await gps.checkAndRequestPermissions();
+      if (hasPerm) {
+        gps.startRecordingTrack();
+        setState(() => _isTrackingMe = true);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final districtsAsync = ref.watch(districtsListProvider);
+    final activeSearchId = ref.watch(activeSearchIdProvider);
+    
+    // Warm up network status listeners
+    ref.read(districtsRealtimeListener);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Карта Поиска', style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          IconButton(
+            icon: Icon(
+              _isTrackingMe ? Icons.location_disabled : Icons.my_location,
+              color: _isTrackingMe ? Colors.red : Colors.green,
+            ),
+            onPressed: _toggleTracking,
+          )
+        ],
+      ),
+      body: activeSearchId == null
+          ? const Center(child: Text('Пожалуйста, выберите операцию в списке поисков для загрузки карты.'))
+          : Stack(
+              children: [
+                // Topographic representation widget
+                Container(
+                  color: const Color(0xff1a2332), // Dark military tactical map canvas
+                  child: Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.map_outlined, size: 84, color: Colors.blueGrey[800]),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'Интерактивная ГИС Векторная Карта',
+                          style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, fontSize: 16),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Рендеринг Google Maps / Yandex MapKit',
+                          style: TextStyle(color: Colors.blueGrey, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                // Pulsing SOS Beacon Layer
+                Positioned(
+                  top: 120,
+                  left: 160,
+                  child: ScaleTransition(
+                    scale: Tween<double>(begin: 0.8, end: 1.3).animate(_pulseController),
+                    child: Container(
+                      width: 28,
+                      height: 28,
+                      decoration: const BoxDecoration(
+                        color: Colors.redAccent,
+                        shape: BoxShape.circle,
+                        boxShadow: [BoxShadow(color: Colors.red, blurRadius: 12)],
+                      ),
+                      child: const Icon(Icons.warning_amber_rounded, size: 16, color: Colors.white),
+                    ),
+                  ),
+                ),
+
+                // Map Overlay Card showing cached shapes
+                Positioned(
+                  bottom: 24,
+                  left: 16,
+                  right: 16,
+                  child: Card(
+                    color: Colors.slate[900]?.withOpacity(0.95),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Row(
+                            mainAxisAlignment: MainAxisAlignment.between,
+                            children: [
+                              Text('Сектора в Drift Cache', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15)),
+                              Icon(Icons.layers_outlined, color: Colors.redAccent),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          districtsAsync.when(
+                            data: (sectors) {
+                              return Text(
+                                'Загружено секторов для поиска: \${sectors.length}\\nАктивные группы: Соколов (Амур-12), Иванова (Заря-4)',
+                                style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
+                              );
+                            },
+                            loading: () => const Text('Загрузка гео-границ секторов...', style: TextStyle(color: Colors.grey)),
+                            error: (e, s) => Text('Ошибка СНХ: \$e', style: const TextStyle(color: Colors.red)),
+                          ),
+                          const Divider(color: Colors.white24, height: 20),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                _isTrackingMe ? '● ОПРЕДЕЛЕНИЕ GPS АКТИВНО' : 'GPS режим ожидания',
+                                style: TextStyle(color: _isTrackingMe ? Colors.green : Colors.grey, fontSize: 12, fontWeight: FontWeight.bold),
+                              ),
+                              TextButton(
+                                onPressed: _toggleTracking,
+                                child: Text(_isTrackingMe ? 'ВЫКЛЮЧИТЬ' : 'ЗАПУСТИТЬ ТРЕК', style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
+                              )
+                            ],
+                          )
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              ],
+            ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/districts/presentation/districts_screen.dart",
+    category: "districts",
+    description: "Sectors listing screen used to check assignment metrics and available boundaries.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/districts_providers.dart';
+import '../domain/models/district_model.dart';
+import 'district_details_screen.dart';
+
+class DistrictsScreen extends ConsumerWidget {
+  const DistrictsScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final listAsync = ref.watch(districtsListProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Секторы и Районы')),
+      body: listAsync.when(
+        data: (sectors) {
+          if (sectors.isEmpty) {
+            return const Center(child: Text('Нет доступных секторов для выбранной операции.'));
+          }
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: sectors.length,
+            itemBuilder: (context, index) {
+              final sector = sectors[index];
+
+              return Card(
+                elevation: 2,
+                margin: const EdgeInsets.only(bottom: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                child: ListTile(
+                  contentPadding: const EdgeInsets.all(12),
+                  title: Text(sector.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  subtitle: Padding(
+                    padding: const EdgeInsets.only(top: 4.0),
+                    child: Text('Площадь: \${sector.areaSqMeters} кв.м • Статус: \${sector.status.toString().split('.').last.toUpperCase()}'),
+                  ),
+                  trailing: Icon(
+                    sector.status == DistrictStatus.free ? Icons.check_circle_outline : Icons.pending_outlined,
+                    color: sector.status == DistrictStatus.free ? Colors.green : Colors.orange,
+                  ),
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => DistrictDetailsScreen(sector: sector)),
+                    );
+                  },
+                ),
+              );
+            },
+          );
+        },
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (e, s) => Center(child: Text('Ошибка ГИС: \$e')),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/districts/presentation/district_details_screen.dart",
+    category: "districts",
+    description: "Scope interaction screen with toggle handles ('Взять район', 'Сдать район') and coordinators review.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/models/district_model.dart';
+import '../providers/districts_providers.dart';
+
+class DistrictDetailsScreen extends ConsumerWidget {
+  final DistrictModel sector;
+
+  const DistrictDetailsScreen({Key? key, required this.sector}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final repo = ref.watch(districtsRepositoryProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: Text(sector.name)),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.slate[50],
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.slate[200]!),
+              ),
+              child: Column(
+                children: [
+                  const Icon(Icons.aspect_ratio, size: 48, color: Colors.blueGrey),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Площадь сектора: \${sector.areaSqMeters} кв.м',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text('Статус обследования: ', style: TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 4),
+                  Chip(
+                    label: Text(sector.status.toString().split('.').last.toUpperCase()),
+                    backgroundColor: sector.status == DistrictStatus.free ? Colors.green[100] : Colors.orange[100],
+                  )
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+            
+            const Text('Границы полигона (гео-координаты):', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            const SizedBox(height: 8),
+            Expanded(
+              child: ListView.builder(
+                itemCount: sector.polygonCoordinates.length,
+                itemBuilder: (context, i) {
+                  final pt = sector.polygonCoordinates[i];
+                  return Text('Точка \${i+1}: Широта \${pt[0]} • Долгота \${pt[1]}', style: const TextStyle(fontSize: 12, color: Colors.blueGrey));
+                },
+              ),
+            ),
+
+            const SizedBox(height: 24),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                minimumSize: const Size.fromHeight(50),
+                backgroundColor: sector.status == DistrictStatus.free ? Colors.green[700] : Colors.red[700],
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () {
+                if (sector.status == DistrictStatus.free) {
+                  repo.assignDistrictOptimistic(
+                    districtId: sector.id,
+                    volunteerId: 'vol_44',
+                    callSign: 'Заря-4 (Иванова)',
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Сектор принят в работу! Отслеживание трека запущено.')),
+                  );
+                } else {
+                  repo.releaseDistrictOptimistic(sector.id);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Район сдан координатору.')),
+                  );
+                }
+                ref.invalidate(districtsListProvider);
+                Navigator.pop(context);
+              },
+              child: Text(
+                sector.status == DistrictStatus.free ? 'ВЗЯТЬ РАЙОН В РАБОТУ' : 'СДАТЬ РАЙОН КООРДИНАТОРУ',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              ),
+            )
+          ],
+        ),
+      ),
+    );
+  }
+}`
   }
 ];
+

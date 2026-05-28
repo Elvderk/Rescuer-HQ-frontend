@@ -786,6 +786,100 @@ export default function App() {
                     Clear Cache DB
                   </button>
                 </div>
+
+                <div className="border-t border-slate-800/80 pt-2.5 space-y-1">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block">Realtime WS Searches Triggers:</span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: search.created published by Coordinator. Spawning Search #26-012.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "search.created",
+                            search_id: "s_cf34_new",
+                            missing_person: "Артем К. (7 лет)",
+                            last_known_place: "Лесной массив КП Саврасово",
+                            coordinator: "Заря-10"
+                          })
+                        );
+                        setDriftDatabaseSize(prev => parseFloat((prev + 0.15).toFixed(2)));
+                      }}
+                      className="py-1 px-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-[#E53E3E] rounded text-[10px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Plus className="w-3 h-3" />
+                      WS Create Search
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: search.status.changed -> COMPLETED for Active Operation. Target found alive!",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "search.status.changed",
+                            search_id: "s_sofia_24",
+                            status: "completed",
+                            sub_status: "foundAlive",
+                            closed_by: "coord_999"
+                          })
+                        );
+                      }}
+                      className="py-1 px-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-sky-400 rounded text-[10px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-3 h-3" />
+                      WS Close Search
+                    </button>
+                  </div>
+                </div>
+
+                <div className="border-t border-slate-800/80 pt-2.5 space-y-1">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block">Realtime GIS & SOS Events:</span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: district.assigned -> Sector A-1 reserved by Заря-4.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "district.assigned",
+                            district_id: "dist_a1",
+                            assigned_to: "Заря-4 (Иванова)",
+                            area_sq_meters: 12000,
+                            time: new Date().toISOString()
+                          })
+                        );
+                        setDriftDatabaseSize(prev => parseFloat((prev + 0.08).toFixed(2)));
+                      }}
+                      className="py-1 px-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-emerald-400 rounded text-[10px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Plus className="w-3 h-3" />
+                      WS Assign Dist
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: volunteer.location.updated. GPS track streamed.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "volunteer.location.updated",
+                            volunteer_id: "vol_44",
+                            callsign: "Заря-4",
+                            coords: [55.7562, 37.6169],
+                            battery: "85%"
+                          })
+                        );
+                      }}
+                      className="py-1 px-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-amber-400 rounded text-[10px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-3 h-3" />
+                      WS Stream Location
+                    </button>
+                  </div>
+                </div>
               </div>
 
             </div>
