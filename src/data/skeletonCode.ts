@@ -2224,5 +2224,476 @@ class PendingApprovalScreen extends ConsumerWidget {
     );
   }
 }`
+  },
+  {
+    path: "lib/features/realtime/domain/realtime_event.dart",
+    category: "realtime",
+    description: "Implements strictly typed event schemas to parse inbound WebSockets message frames.",
+    content: `import 'dart:convert';
+import 'package:flutter/foundation.dart';
+
+@immutable
+class RealtimeEvent {
+  final String uuid;
+  final String eventType;
+  final DateTime timestamp;
+  final String? roomId;
+  final Map<String, dynamic> payload;
+
+  const RealtimeEvent({
+    required this.uuid,
+    required this.eventType,
+    required this.timestamp,
+    this.roomId,
+    required this.payload,
+  });
+
+  factory RealtimeEvent.fromJson(Map<String, dynamic> json) {
+    return RealtimeEvent(
+      uuid: json['uuid'] as String? ?? '',
+      eventType: json['event_type'] as String? ?? 'unknown',
+      timestamp: json['timestamp'] != null 
+          ? DateTime.parse(json['timestamp'] as String) 
+          : DateTime.now(),
+      roomId: json['room_id'] as String?,
+      payload: json['payload'] as Map<String, dynamic>? ?? {},
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'uuid': uuid,
+      'event_type': eventType,
+      'timestamp': timestamp.toIso8601String(),
+      'room_id': roomId,
+      'payload': payload,
+    };
+  }
+}`
+  },
+  {
+    path: "lib/core/services/websocket_event_dispatcher.dart",
+    category: "realtime",
+    description: "Filters duplicate frames, manages stream cleanup, and routes network triggers towards registered listeners.",
+    content: `import 'dart:async';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../features/realtime/domain/realtime_event.dart';
+
+final webSocketEventDispatcherProvider = Provider<WebSocketEventDispatcher>((ref) {
+  return WebSocketEventDispatcher();
+});
+
+class WebSocketEventDispatcher {
+  final StreamController<RealtimeEvent> _eventStreamController = StreamController<RealtimeEvent>.broadcast();
+  final List<String> _seenEventIds = [];
+  static const int _deduplicationCacheSize = 100;
+
+  Stream<RealtimeEvent> get rawEvents => _eventStreamController.stream;
+
+  void dispatch(Map<String, dynamic> rawJson) {
+    try {
+      if (rawJson['type'] == 'ping' || rawJson['type'] == 'pong') {
+        return;
+      }
+
+      final event = RealtimeEvent.fromJson(rawJson);
+
+      // Guard duplicate events on low-bandwidth channels
+      if (_seenEventIds.contains(event.uuid)) {
+        print('[WS DISPATCH] Duplicate event discarded: \${event.uuid}');
+        return;
+      }
+
+      _seenEventIds.add(event.uuid);
+      if (_seenEventIds.length > _deduplicationCacheSize) {
+        _seenEventIds.removeAt(0);
+      }
+
+      _eventStreamController.add(event);
+      print('[WS DISPATCH] Routed typing event: \${event.eventType}');
+    } catch (e) {
+      print('[WS DISPATCH] Marshalling error in dispatch payload: \$e');
+    }
+  }
+
+  Stream<RealtimeEvent> listenToChannel(String? roomId) {
+    return _eventStreamController.stream.where((event) => event.roomId == roomId);
+  }
+
+  Stream<RealtimeEvent> listenToType(String eventType) {
+    return _eventStreamController.stream.where((event) => event.eventType == eventType);
+  }
+
+  void dispose() {
+    _eventStreamController.close();
+  }
+}`
+  },
+  {
+    path: "lib/core/services/websocket_service.dart",
+    category: "realtime",
+    description: "Central manager of socket channels. Keeps channel heartbeat, reconnect threshold retry backoffs, and auth integrity tokens.",
+    content: `import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+import 'websocket_event_dispatcher.dart';
+import '../../features/auth/providers/auth_notifier.dart';
+
+enum WebSocketConnectionStatus {
+  disconnected,
+  connecting,
+  connected,
+  reconnecting,
+}
+
+final webSocketServiceProvider = Provider<WebSocketService>((ref) {
+  final dispatcher = ref.watch(webSocketEventDispatcherProvider);
+  return WebSocketService(ref, dispatcher);
+});
+
+final webSocketStatusProvider = StreamProvider<WebSocketConnectionStatus>((ref) {
+  final ws = ref.watch(webSocketServiceProvider);
+  return ws.statusStream;
+});
+
+class WebSocketService with WidgetsBindingObserver {
+  final Ref _ref;
+  final WebSocketEventDispatcher _dispatcher;
+  
+  WebSocketChannel? _channel;
+  WebSocketConnectionStatus _status = WebSocketConnectionStatus.disconnected;
+  final StreamController<WebSocketConnectionStatus> _statusController = StreamController<WebSocketConnectionStatus>.broadcast();
+
+  int _reconnectAttempts = 0;
+  final int _maxReconnectAttempts = 10;
+  Timer? _reconnectTimer;
+  
+  Timer? _heartbeatTimer;
+  Timer? _pongTimeoutTimer;
+  static const Duration _pingInterval = Duration(seconds: 30);
+  static const Duration _pongTimeout = Duration(seconds: 10);
+  bool _waitingForPong = false;
+
+  final Set<String> _activeSubscribedRooms = {};
+
+  WebSocketService(this._ref, this._dispatcher) {
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  WebSocketConnectionStatus get status => _status;
+  Stream<WebSocketConnectionStatus> get statusStream => _statusController.stream;
+
+  void _updateStatus(WebSocketConnectionStatus newStatus) {
+    _status = newStatus;
+    _statusController.add(newStatus);
+    print('[WS SERVICE] Connection state swapped: \$newStatus');
+  }
+
+  Future<void> connect() async {
+    if (_status == WebSocketConnectionStatus.connected || _status == WebSocketConnectionStatus.connecting) {
+      return;
+    }
+
+    _updateStatus(WebSocketConnectionStatus.connecting);
+    _reconnectTimer?.cancel();
+
+    try {
+      final token = await _ref.read(authProvider.notifier).getAccessToken();
+      if (token == null) {
+        print('[WS SERVICE] Setup rejected. Security credentials missing.');
+        _updateStatus(WebSocketConnectionStatus.disconnected);
+        return;
+      }
+
+      final wsUri = Uri.parse('wss://api.rescuerhq.org/ws?token=\$token');
+      _channel = WebSocketChannel.connect(wsUri);
+
+      _channel!.stream.listen(
+        (message) {
+          _handleRawMessage(message);
+        },
+        onError: (err) {
+          print('[WS SERVICE] Handshake stream triggered error: \$err');
+          _handleDisconnection();
+        },
+        onDone: () {
+          print('[WS SERVICE] Raw stream connection closed by server gateway.');
+          _handleDisconnection();
+        },
+        cancelOnError: true,
+      );
+
+      _updateStatus(WebSocketConnectionStatus.connected);
+      _reconnectAttempts = 0;
+      _startHeartbeat();
+      _replayActiveRoomSubscriptions();
+    } catch (e) {
+      print('[WS SERVICE] Gateway error on initial connection: \$e');
+      _handleDisconnection();
+    }
+  }
+
+  void _handleRawMessage(dynamic message) {
+    try {
+      final rawJson = jsonDecode(message as String) as Map<String, dynamic>;
+      
+      if (rawJson['type'] == 'pong') {
+        _waitingForPong = false;
+        _pongTimeoutTimer?.cancel();
+        return;
+      }
+
+      _dispatcher.dispatch(rawJson);
+    } catch (e) {
+      print('[WS SERVICE] Error parsing raw JSON package: \$e');
+    }
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _pongTimeoutTimer?.cancel();
+    _waitingForPong = false;
+
+    _heartbeatTimer = Timer.periodic(_pingInterval, (timer) {
+      if (_status != WebSocketConnectionStatus.connected) return;
+
+      try {
+        _channel?.sink.add(jsonEncode({'type': 'ping'}));
+        _waitingForPong = true;
+
+        _pongTimeoutTimer = Timer(_pongTimeout, () {
+          if (_waitingForPong) {
+            print('[WS SERVICE] Ping timeout breached! No pong from active server gateway.');
+            _reconnectTimer?.cancel();
+            _channel?.sink.close();
+            _handleDisconnection();
+          }
+        });
+      } catch (e) {
+        print('[WS SERVICE] Heartbeat transmission exception: \$e');
+        _handleDisconnection();
+      }
+    });
+  }
+
+  void _handleDisconnection() {
+    _heartbeatTimer?.cancel();
+    _pongTimeoutTimer?.cancel();
+    
+    if (_status == WebSocketConnectionStatus.disconnected) return;
+
+    if (_reconnectAttempts < _maxReconnectAttempts) {
+      _updateStatus(WebSocketConnectionStatus.reconnecting);
+      _scheduleReconnection();
+    } else {
+      print('[WS SERVICE] Maximum reconnection thresholds bypassed. Terminating channel.');
+      _updateStatus(WebSocketConnectionStatus.disconnected);
+    }
+  }
+
+  void _scheduleReconnection() {
+    _reconnectTimer?.cancel();
+    _reconnectAttempts++;
+    
+    final delaySeconds = min(2 * pow(2, _reconnectAttempts), 60).toDouble();
+    print('[WS SERVICE] Rescheduling reconnect attempt #\$_reconnectAttempts in \$delaySeconds seconds.');
+
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds.toInt()), () {
+      connect();
+    });
+  }
+
+  void subscribeToRoom(String roomId) {
+    _activeSubscribedRooms.add(roomId);
+    if (_status == WebSocketConnectionStatus.connected) {
+      _sendSubscriptionPayload(roomId);
+    }
+  }
+
+  void unsubscribeFromRoom(String roomId) {
+    _activeSubscribedRooms.remove(roomId);
+    if (_status == WebSocketConnectionStatus.connected) {
+      _sendUnsubscriptionPayload(roomId);
+    }
+  }
+
+  void _sendSubscriptionPayload(String roomId) {
+    try {
+      _channel?.sink.add(jsonEncode({
+        'action': 'subscribe',
+        'room': roomId,
+        'timestamp': DateTime.now().toIso8601String(),
+      }));
+      print('[WS SERVICE] Subscribed packet dispatched for area room: \$roomId');
+    } catch (e) {
+      print('[WS SERVICE] Subscription dispatch crashed: \$e');
+    }
+  }
+
+  void _sendUnsubscriptionPayload(String roomId) {
+    try {
+      _channel?.sink.add(jsonEncode({
+        'action': 'unsubscribe',
+        'room': roomId,
+        'timestamp': DateTime.now().toIso8601String(),
+      }));
+    } catch (_) {}
+  }
+
+  void _replayActiveRoomSubscriptions() {
+    for (final room in _activeSubscribedRooms) {
+      _sendSubscriptionPayload(room);
+    }
+  }
+
+  void sendEvent(String eventType, Map<String, dynamic> payload, {String? roomId}) {
+    if (_status != WebSocketConnectionStatus.connected) {
+      print('[WS SERVICE] Dispatch bypassed: Socket is not globally connected.');
+      return;
+    }
+
+    try {
+      final message = {
+        'uuid': 'msg_loc_\${DateTime.now().millisecondsSinceEpoch}',
+        'event_type': eventType,
+        'timestamp': DateTime.now().toIso8601String(),
+        'room_id': roomId,
+        'payload': payload,
+      };
+      _channel?.sink.add(jsonEncode(message));
+    } catch (e) {
+      print('[WS SERVICE] Event dispatch failed: \$e');
+    }
+  }
+
+  void disconnect() {
+    _reconnectTimer?.cancel();
+    _heartbeatTimer?.cancel();
+    _pongTimeoutTimer?.cancel();
+    _activeSubscribedRooms.clear();
+    
+    _channel?.sink.close();
+    _updateStatus(WebSocketConnectionStatus.disconnected);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      print('[WS SERVICE] App going to background. Pausing non-crucial traffic loops.');
+      _heartbeatTimer?.cancel();
+      _pongTimeoutTimer?.cancel();
+    } else if (state == AppLifecycleState.resumed) {
+      print('[WS SERVICE] App entering foreground. Resuming socket connections.');
+      if (_status == WebSocketConnectionStatus.connected) {
+        _startHeartbeat();
+      } else {
+        connect();
+      }
+    }
+  }
+
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    disconnect();
+    _statusController.close();
+  }
+}`
+  },
+  {
+    path: "lib/features/realtime/data/realtime_repository.dart",
+    category: "realtime",
+    description: "Connects features channels lists and transmits formatted message payloads.",
+    content: `import '../../realtime/domain/realtime_event.dart';
+import '../../../core/services/websocket_service.dart';
+import '../../../core/services/websocket_event_dispatcher.dart';
+
+class RealtimeRepository {
+  final WebSocketService _wsService;
+  final WebSocketEventDispatcher _dispatcher;
+
+  RealtimeRepository(this._wsService, this._dispatcher);
+
+  void subscribeToSearch(String searchId) {
+    _wsService.subscribeToRoom('search_room_\$searchId');
+  }
+
+  void unsubscribeFromSearch(String searchId) {
+    _wsService.unsubscribeFromRoom('search_room_\$searchId');
+  }
+
+  void subscribeToChat(String chatRoomId) {
+    _wsService.subscribeToRoom('chat_room_\$chatRoomId');
+  }
+
+  void unsubscribeFromChat(String chatRoomId) {
+    _wsService.unsubscribeFromRoom('chat_room_\$chatRoomId');
+  }
+
+  void subscribeToSOS(String sosChannelId) {
+    _wsService.subscribeToRoom('sos_channel_\$sosChannelId');
+  }
+
+  Stream<RealtimeEvent> get chatMessages => _dispatcher.listenToType('chat.message.created');
+  Stream<RealtimeEvent> get taskUpdates => _dispatcher.listenToType('task.updated');
+  Stream<RealtimeEvent> get SOSAlerts => _dispatcher.listenToType('sos.created');
+  Stream<RealtimeEvent> get locationUpdates => _dispatcher.listenToType('volunteer.location.updated');
+
+  void broadcastLocationUpdate({
+    required double lat,
+    required double lng,
+    required double accuracy,
+    required double battery,
+  }) {
+    _wsService.sendEvent(
+      'volunteer.location.updated',
+      {
+        'latitude': lat,
+        'longitude': lng,
+        'accuracy': accuracy,
+        'battery_level': battery,
+      },
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/realtime/providers/realtime_providers.dart",
+    category: "realtime",
+    description: "Exposes Reactive provider subscriptions and active stream loops.",
+    content: `import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/realtime_event.dart';
+import '../data/realtime_repository.dart';
+import '../../../core/services/websocket_service.dart';
+import '../../../core/services/websocket_event_dispatcher.dart';
+
+final realtimeRepositoryProvider = Provider<RealtimeRepository>((ref) {
+  final ws = ref.watch(webSocketServiceProvider);
+  final dispatcher = ref.watch(webSocketEventDispatcherProvider);
+  return RealtimeRepository(ws, dispatcher);
+});
+
+final chatMessagesStreamProvider = StreamProvider<RealtimeEvent>((ref) {
+  final repo = ref.watch(realtimeRepositoryProvider);
+  return repo.chatMessages;
+});
+
+final taskUpdatesStreamProvider = StreamProvider<RealtimeEvent>((ref) {
+  final repo = ref.watch(realtimeRepositoryProvider);
+  return repo.taskUpdates;
+});
+
+final sosAlertStreamProvider = StreamProvider<RealtimeEvent>((ref) {
+  final repo = ref.watch(realtimeRepositoryProvider);
+  return repo.SOSAlerts;
+});
+
+final locationUpdatesStreamProvider = StreamProvider<RealtimeEvent>((ref) {
+  final repo = ref.watch(realtimeRepositoryProvider);
+  return repo.locationUpdates;
+});`
   }
 ];
