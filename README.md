@@ -66,6 +66,8 @@ This project contains pristine, production-ready Dart templates matching the str
 | `sos_notifier.dart` | **SOS Panic Driver** | Elevates location polling to maximum rate, activates foreground alerts, and sends alarms to HQ. |
 | `search_map_screen.dart`| **Topography Map UI** | Overlays Google Maps elements with custom dark night-vision parameters and sector polygons. |
 | `auth_provider.dart` | **Secure JWT Wrapper**| Holds security claims, decodes bearer signatures, and stores authorization values securely. |
+| `logger_service.dart` | **Diagnostic Telemetry**| Central structured logging framework tracking exception contexts inside the telemetry pipeline. |
+| `lifecycle_manager.dart`| **Central Lifecycle** | Central observer managing websocket pause-resume cycles during system swaps. |
 
 ---
 
@@ -121,3 +123,15 @@ The background location tracker automatically changes parameters based on system
 | **Standard** | Operational Area Entry | 30 seconds | 50 meters | **Enabled** | Standard background rescue update notification. |
 | **SOS High-Precision**| Volunteer triggers SOS button| 5 seconds | 5 meters | **Force Active** | Loud alarm notification with live distress signals. |
 | **Low-Battery Saver** | Battery drops below 15% | 120 seconds | 200 meters | *Disabled* | Eco-mode active. Battery saver constraints active. |
+
+---
+
+## 📋 6. System Architecture & Stabilization Blueprints
+
+For in-depth explanations and checklists for each feature, consult the rich documentation stored in `/src/data/`:
+- **[PRODUCTION_POLISH.md](/src/data/PRODUCTION_POLISH.md)**: Full production audit report covering Riverpod fine-grained reactive updates, battery throttles, Last-Write-Wins offline database conflict resolutions, R8/Proguard rules, and release configurations.
+- **[MOBILE_SYSTEM_DESIGN.md](/src/data/MOBILE_SYSTEM_DESIGN.md)**: Comprehensive mobile system architecture review.
+- **[REALTIME_ARCHITECTURE.md](/src/data/REALTIME_ARCHITECTURE.md)** & **[SOS_ARCHITECTURE.md](/src/data/SOS_ARCHITECTURE.md)**: Secure WebSocket framing models and extreme event flows.
+- **[OFFLINE_ARCHITECTURE.md](/src/data/OFFLINE_ARCHITECTURE.md)**: SQLite transactional caching with Drift local queuing engine.
+- **[DISTRICTS_MAPS_ARCHITECTURE.md](/src/data/DISTRICTS_MAPS_ARCHITECTURE.md)**: Map layering, poly-splitting, and marker clustering specifications.
+- **[AUTH_ARCHITECTURE.md](/src/data/AUTH_ARCHITECTURE.md)**, **[CHAT_ARCHITECTURE.md](/src/data/CHAT_ARCHITECTURE.md)**, **[TASKS_ARCHITECTURE.md](/src/data/TASKS_ARCHITECTURE.md)**: Horizontal boundary modules.

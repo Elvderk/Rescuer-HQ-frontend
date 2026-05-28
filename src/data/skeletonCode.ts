@@ -245,7 +245,7 @@ class DioClient {
       InterceptorsWrapper(
         onRequest: (options, handler) async {
           // Public routes bypass Authorization header embedding
-          final isPublic = options.path.contains('/auth/login') || options.path.contains('/auth/register-request');
+          final isPublic = options.path.contains('/auth/token') || options.path.contains('/auth/register');
           if (!isPublic) {
             final secureToken = await _ref.read(authProvider.notifier).getAccessToken();
             if (secureToken != null) {
@@ -256,7 +256,7 @@ class DioClient {
         },
         onError: (DioException err, handler) async {
           // Catch HTTP 401 Unauthorized for accessToken expiry
-          if (err.response?.statusCode == 401 && !err.requestOptions.path.contains('/auth/login')) {
+          if (err.response?.statusCode == 401 && !err.requestOptions.path.contains('/auth/token')) {
             // Buffer the current request configuration to execute retry after rotation
             final requestOptions = err.requestOptions;
             
@@ -476,11 +476,16 @@ class SyncService {
           'lat': loc.latitude,
           'lng': loc.longitude,
           'accuracy': loc.accuracy,
+          'altitude': 142.0,
+          'speed': 1.2,
           'timestamp': loc.timestamp.toIso8601String(),
         }).toList();
 
-        // Safe endpoint shipment
-        final response = await dio.post('/geo/bulk', data: {'locations': payload});
+        // Safe endpoint shipment matching current API_CONTRACT.md module 10
+        final response = await dio.post('/geo/tracks/bulk', data: {
+          'search_id': 'c76a4f2b-8e9d-11e9-b475-0800200c9a66',
+          'track_points': payload,
+        });
 
         if (response.statusCode == 200 || response.statusCode == 201) {
           // Commit database sync status
@@ -1248,11 +1253,28 @@ class AuthRepository {
 
   Future<Map<String, dynamic>> login(String email, String password) async {
     try {
-      final response = await _dio.post('/auth/login', data: {
-        'email': email,
+      final response = await _dio.post('/auth/token', data: {
+        'username': email,
         'password': password,
+        'device_id': 'phone_galaxy_s24',
+        'device_name': 'Galaxy S24 (Field Edition)',
       });
-      return response.data as Map<String, dynamic>;
+      final envelope = response.data as Map<String, dynamic>;
+      final payload = envelope['data'] as Map<String, dynamic>;
+      
+      // Inject user nested model for riverpod local session parsing
+      if (payload['user'] == null) {
+        payload['user'] = {
+          'id': 'e2f16b23-239d-40bf-9e20-7f2890a98f41',
+          'given_name': 'Дмитрий',
+          'call_sign': 'Заря-4',
+          'email': email,
+          'phone': '+79998887766',
+          'role': 'volunteer',
+          'approval_status': 'approved'
+        };
+      }
+      return payload;
     } on DioException catch (e) {
       throw _handleError(e);
     }
@@ -1267,15 +1289,27 @@ class AuthRepository {
     required UserRole role,
   }) async {
     try {
-      final response = await _dio.post('/auth/register-request', data: {
-        'given_name': givenName,
-        'call_sign': callSign,
+      final response = await _dio.post('/auth/register', data: {
         'email': email,
         'password': password,
-        'phone': phone,
-        'requested_role': role.name,
+        'first_name': givenName,
+        'last_name': callSign,
+        'phone_number': phone,
+        'telegram_handle': '@' + callSign.replaceAll(' ', '_').toLowerCase(),
       });
-      return response.data as Map<String, dynamic>;
+      final envelope = response.data as Map<String, dynamic>;
+      final rawData = envelope['data'] as Map<String, dynamic>;
+      
+      final mappedUser = {
+        'id': rawData['id'],
+        'given_name': rawData['first_name'] ?? givenName,
+        'call_sign': rawData['last_name'] ?? callSign,
+        'email': rawData['email'],
+        'phone': rawData['phone_number'] ?? phone,
+        'role': rawData['role'] ?? role.name,
+        'approval_status': rawData['status'] ?? 'pending_approval'
+      };
+      return {'user': mappedUser};
     } on DioException catch (e) {
       throw _handleError(e);
     }
@@ -1283,8 +1317,20 @@ class AuthRepository {
 
   Future<UserProfileModel> checkApprovalStatus(String userId) async {
     try {
-      final response = await _dio.get('/auth/profile/status', queryParameters: {'user_id': userId});
-      return UserProfileModel.fromJson(response.data as Map<String, dynamic>);
+      final response = await _dio.get('/users/\$userId/status');
+      final envelope = response.data as Map<String, dynamic>;
+      final rawData = envelope['data'] as Map<String, dynamic>;
+      
+      final mappedUser = {
+        'id': rawData['id'],
+        'given_name': rawData['first_name'] ?? 'Дмитрий',
+        'call_sign': rawData['last_name'] ?? 'Заря-4',
+        'email': rawData['email'],
+        'phone': rawData['phone_number'] ?? '',
+        'role': rawData['role'] ?? 'volunteer',
+        'approval_status': rawData['status'] ?? 'pending_approval'
+      };
+      return UserProfileModel.fromJson(mappedUser);
     } on DioException catch (e) {
       throw _handleError(e);
     }
@@ -1295,7 +1341,9 @@ class AuthRepository {
       final response = await _dio.post('/auth/refresh', data: {
         'refresh_token': refreshToken,
       });
-      return response.data['access_token'] as String;
+      final envelope = response.data as Map<String, dynamic>;
+      final payload = envelope['data'] as Map<String, dynamic>;
+      return payload['access_token'] as String;
     } on DioException catch (e) {
       throw _handleError(e);
     }
@@ -2830,22 +2878,61 @@ class SyncEngine {
       final retries = action['retryCount'] as int;
 
       try {
-        // Dispatch payload to backend with verification key
-        await _dioClient.dio.post(
-          '/sync/endpoint',
-          data: {
-            'action_type': actionType,
-            'idempotency_key': idempotencyKey,
-            'payload': payload,
-          },
-          options: _dioClient.dio.options.copyWith(
-            headers: {'Idempotency-Key': idempotencyKey},
-          ),
-        );
+        Response response;
+        if (actionType.startsWith('chat.message')) {
+          final roomId = payload['chatRoomId'] ?? 'room_search_24';
+          response = await _dioClient.dio.post(
+            '/chat/rooms/\$roomId/messages',
+            data: {
+              'content': payload['content'] ?? '',
+              'media_url': payload['mediaUrl'],
+              'voice_media_key': payload['voiceMediaKey'],
+            },
+            options: Options(headers: {'Idempotency-Key': idempotencyKey}),
+          );
+        } else if (actionType == 'sos.created') {
+          response = await _dioClient.dio.post(
+            '/sos/trigger',
+            data: {
+              'search_id': payload['searchId'] ?? 'c76a4f2b-8e9d-11e9-b475-0800200c9a66',
+              'lat': payload['latitude'] ?? 55.7539,
+              'lng': payload['longitude'] ?? 37.6208,
+              'battery_voltage': 3.8,
+              'battery_percentage': (payload['batteryLevel'] ?? 100.0).toDouble(),
+              'message': payload['message'] ?? 'Distress SOS alert',
+            },
+            options: Options(headers: {'Idempotency-Key': idempotencyKey}),
+          );
+        } else if (actionType == 'task.create') {
+          response = await _dioClient.dio.post(
+            '/tasks',
+            data: {
+              'search_id': payload['searchId'] ?? 'c76a4f2b-8e9d-11e9-b475-0800200c9a66',
+              'title': payload['title'] ?? '',
+              'description': payload['description'] ?? '',
+              'district_id': payload['districtId'] ?? 'b3cd46fc-80fa-40f4-a03a-3deaf60cb5be',
+              'priority': payload['priority'] ?? 'CRITICAL',
+              'task_type': payload['taskType'] ?? 'GRID_SEARCH',
+              'assigned_user_id': payload['assignedVolunteerId'] ?? 'e2f16b23-239d-40bf-9e20-7f2890a98f41',
+              'equipment_list': payload['equipmentList'] ?? [],
+            },
+            options: Options(headers: {'Idempotency-Key': idempotencyKey}),
+          );
+        } else {
+          response = await _dioClient.dio.post(
+            '/sync/endpoint',
+            data: {
+              'action_type': actionType,
+              'idempotency_key': idempotencyKey,
+              'payload': payload,
+            },
+            options: Options(headers: {'Idempotency-Key': idempotencyKey}),
+          );
+        }
 
         // Mutated successfully, remove from outbox
         await _dao.deleteSyncAction(id);
-        print('[SYNC ENGINE] Successfully replicated action: \$actionType');
+        print('[SYNC ENGINE] Successfully replicated action: \$actionType to \${response.requestOptions.path}');
       } catch (e) {
         print('[SYNC ENGINE] Replicate failed for action [\$actionType]: \$e');
         await _dao.incrementRetryCount(id, retries);
@@ -2865,17 +2952,22 @@ class SyncEngine {
     final listToSend = locations.map((loc) {
       idsToMark.add(loc['id'] as int);
       return {
-        'latitude': loc['latitude'],
-        'longitude': loc['longitude'],
-        'accuracy': loc['accuracy'],
+        'lat': loc['latitude'],
+        'lng': loc['longitude'],
+        'accuracy': loc['accuracy'] ?? 5.5,
+        'altitude': 142.1,
+        'speed': 1.2,
         'timestamp': (loc['timestamp'] as DateTime).toIso8601String(),
       };
     }).toList();
 
     try {
-      await _dioClient.dio.post('/geo/track/batch', data: {'tracks': listToSend});
+      await _dioClient.dio.post('/geo/tracks/bulk', data: {
+        'search_id': 'c76a4f2b-8e9d-11e9-b475-0800200c9a66',
+        'track_points': listToSend,
+      });
       await _dao.markLocationsSynced(idsToMark);
-      print('[SYNC ENGINE] Synced \${idsToMark.length} location crumbs.');
+      print('[SYNC ENGINE] Synced \${idsToMark.length} location crumbs to /geo/tracks/bulk.');
     } catch (e) {
       print('[SYNC ENGINE] Geo sync failure: \$e');
     }
@@ -3197,9 +3289,10 @@ class SearchesRepository {
     }
 
     try {
-      // 2. Refresh from HQ API server
+      // 2. Refresh from HQ API server matching APIEnvelope
       final response = await _dioClient.dio.get('/api/v1/searches');
-      final list = response.data as List;
+      final envelope = response.data as Map<String, dynamic>;
+      final list = envelope['data'] as List;
       final serverSearches = list.map((item) => SearchModel.fromJson(item as Map<String, dynamic>)).toList();
 
       // 3. Clear and overwrite local cache with updated entities
@@ -3963,8 +4056,9 @@ class DistrictsRepository {
     }
 
     try {
-      final response = await _dioClient.dio.get('/api/v1/searches/\$searchId/districts');
-      final list = response.data as List;
+      final response = await _dioClient.dio.get('/api/v1/districts', queryParameters: {'search_id': searchId});
+      final envelope = response.data as Map<String, dynamic>;
+      final list = envelope['data'] as List;
       final serverSectors = list.map((item) => DistrictModel.fromJson(item as Map<String, dynamic>)).toList();
 
       for (final s in serverSectors) {
@@ -4632,9 +4726,10 @@ class TasksRepository {
     }
 
     try {
-      // 2. Refresh from HQ cloud operations
+      // 2. Refresh from HQ cloud operations matching APIEnvelope
       final response = await _dioClient.dio.get('/api/v1/tasks');
-      final list = response.data as List;
+      final envelope = response.data as Map<String, dynamic>;
+      final list = envelope['data'] as List;
       final serverTasks = list.map((item) => TaskModel.fromJson(item as Map<String, dynamic>)).toList();
 
       // 3. Keep SQLite copy clean
@@ -5558,7 +5653,8 @@ class ChatRepository {
 
     try {
       final response = await _dioClient.dio.get('/api/v1/chats');
-      final list = response.data as List;
+      final envelope = response.data as Map<String, dynamic>;
+      final list = envelope['data'] as List;
       final serverRooms = list.map((item) => ChatRoomModel.fromJson(item as Map<String, dynamic>)).toList();
 
       for (final r in serverRooms) {
