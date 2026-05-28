@@ -1092,6 +1092,40 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
+                <div className="border-t border-slate-800/80 pt-2.5 space-y-1">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block">Diagnostics & Lifecycle:</span>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "LIFECYCLE TRIGGER: appState -> BACKGROUND. Shutting down websockets and suspension-unsafe timers.",
+                          "status",
+                          "info",
+                          "LIFECYCLE: State changed to appState.paused. Disconnecting socket..."
+                        );
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-yellow-500/90 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      Pause (Background)
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "LIFECYCLE TRIGGER: appState -> FOREGROUND. Resuming websocket connection & delta syncing.",
+                          "status",
+                          "success",
+                          "LIFECYCLE: State changed to appState.resumed. Reconnecting & synchronizing states..."
+                        );
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-emerald-500 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      Resume (Foreground)
+                    </button>
+                  </div>
+                </div>
               </div>
 
             </div>

@@ -329,114 +329,6 @@ class DioClient {
 }`
   },
   {
-    path: "lib/core/services/websocket_service.dart",
-    category: "realtime",
-    description: "Resilient WebSocket engine. Performs server-side ping/pong diagnostics, presence beacons, and dispatches real-time broadcast topics like SOS, participant updates, and loc-traces.",
-    content: `import 'dart:async';
-import 'dart:convert';
-import 'package:web_socket_channel/web_socket_channel.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
-
-import '../../features/auth/providers/auth_provider.dart';
-
-final webSocketServiceProvider = Provider<WebSocketService>((ref) {
-  return WebSocketService(ref);
-});
-
-class WebSocketService {
-  final Ref _ref;
-  WebSocketChannel? _channel;
-  Timer? _heartbeatTimer;
-  bool _isConnected = false;
-  int _reconnectAttempts = 0;
-  
-  final _eventStreamController = StreamController<Map<String, dynamic>>.broadcast();
-  Stream<Map<String, dynamic>> get eventStream => _eventStreamController.stream;
-
-  WebSocketService(this._ref);
-
-  Future<void> connect() async {
-    if (_isConnected) return;
-
-    final token = await _ref.read(authProvider.notifier).getAccessToken();
-    if (token == null) return;
-
-    final wsUri = Uri.parse('wss://api.rescuerhq.org/ws?token=\$token');
-    
-    try {
-      _channel = WebSocketChannel.connect(wsUri);
-      _isConnected = true;
-      _reconnectAttempts = 0;
-
-      _channel!.stream.listen(
-        (data) => _onEventReceived(data),
-        onDone: () => _handleDisconnect(),
-        onError: (error) => _handleDisconnect(),
-      );
-
-      _startHeartbeat();
-    } catch (_) {
-      _handleDisconnect();
-    }
-  }
-
-  void _onEventReceived(dynamic data) {
-    try {
-      final parsed = jsonDecode(data) as Map<String, dynamic>;
-      
-      // Keep track of pong signals
-      if (parsed['event'] == 'pong') return;
-
-      // Dispatch events into the global raw event bus
-      _eventStreamController.add(parsed);
-    } catch (e) {
-      print("[WS] JSON decode error: \$e");
-    }
-  }
-
-  void send(String event, Map<String, dynamic> payload) {
-    if (_channel == null || !_isConnected) return;
-    
-    final envelope = {
-      'event': event,
-      'timestamp': DateTime.now().toUtc().toIso8601String(),
-      'payload': payload,
-    };
-    
-    _channel!.sink.add(jsonEncode(envelope));
-  }
-
-  void _startHeartbeat() {
-    _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
-      if (_isConnected) {
-        send('ping', {});
-      }
-    });
-  }
-
-  void _handleDisconnect() {
-    _isConnected = false;
-    _channel?.sink.close();
-    _heartbeatTimer?.cancel();
-
-    // Exponential Retry Backoff (Cap at 60s max spacing)
-    _reconnectAttempts++;
-    final delay = Duration(seconds: (_reconnectAttempts * 5).clamp(2, 60));
-    print("[WS] Disconnected. Reconnecting in \${delay.inSeconds} seconds...");
-    
-    Timer(delay, () => connect());
-  }
-
-  void disconnect() {
-    _isConnected = false;
-    _channel?.sink.close();
-    _heartbeatTimer?.cancel();
-    _reconnectAttempts = 0;
-  }
-}`
-  },
-  {
     path: "lib/core/database/app_database.dart",
     category: "database",
     description: "Reactive SQLite local database built on Drift (moor). Houses rich database tables with automatic index configurations, raw query handlers, and local queues.",
@@ -7161,6 +7053,138 @@ class EmergencyConfirmationDialog extends StatelessWidget {
         )
       ],
     );
+  }
+}`
+  },
+  {
+    path: "lib/core/services/logger_service.dart",
+    category: "diagnostic",
+    description: "Central structured telemetry framework tracking exception contexts.",
+    content: `enum LogLevel {
+  debug,
+  info,
+  warning,
+  error,
+  critical
+}
+
+class LoggerEntry {
+  final DateTime timestamp;
+  final LogLevel level;
+  final String tag;
+  final String message;
+  final String? exceptionDetails;
+
+  const LoggerEntry({
+    required this.timestamp,
+    required this.level,
+    required this.tag,
+    required this.message,
+    this.exceptionDetails,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'timestamp': timestamp.toIso8601String(),
+      'level': level.toString().split('.').last,
+      'tag': tag,
+      'message': message,
+      'exception_details': exceptionDetails,
+    };
+  }
+}
+
+class LoggerService {
+  static final LoggerService instance = LoggerService._();
+  LoggerService._();
+
+  final List<LoggerEntry> _inMemoryBuffer = [];
+  static const int _maxInMemoryCapacity = 300;
+
+  void log(LogLevel level, String tag, String message, {String? exception}) {
+    final entry = LoggerEntry(
+      timestamp: DateTime.now(),
+      level: level,
+      tag: tag,
+      message: message,
+      exceptionDetails: exception,
+    );
+
+    _inMemoryBuffer.add(entry);
+    if (_inMemoryBuffer.length > _maxInMemoryCapacity) {
+      _inMemoryBuffer.removeAt(0);
+    }
+
+    // Direct console routing with beautiful custom terminal coloring
+    final prefix = '[RESCUER HQ - \${level.toString().split('.').last.toUpperCase()}]';
+    print('\$prefix [\$tag]: \$message \${exception != null ? "\\nException: $exception" : ""}');
+  }
+
+  void debug(String tag, String message) => log(LogLevel.debug, tag, message);
+  void info(String tag, String message) => log(LogLevel.info, tag, message);
+  void warning(String tag, String message) => log(LogLevel.warning, tag, message);
+  void error(String tag, String message, {String? ex}) => log(LogLevel.error, tag, message, exception: ex);
+  void critical(String tag, String message, {String? ex}) => log(LogLevel.critical, tag, message, exception: ex);
+
+  List<LoggerEntry> getBufferedEntries() => List.unmodifiable(_inMemoryBuffer);
+  
+  void flush() {
+    _inMemoryBuffer.clear();
+    print('[LOGGER] Diagnostical in-memory logs buffer cleared.');
+  }
+}`
+  },
+  {
+    path: "lib/core/services/lifecycle_manager.dart",
+    category: "lifecycle",
+    description: "Central lifecycle listener orchestrating clean websocket pause-resume cycles.",
+    content: `import 'package:flutter/widgets.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'logger_service.dart';
+import 'websocket_service.dart';
+import 'sync/sync_engine.dart';
+
+final appLifecycleManagerProvider = Provider<AppLifecycleManager>((ref) {
+  final ws = ref.watch(webSocketServiceProvider);
+  final sync = ref.watch(syncEngineProvider);
+  return AppLifecycleManager(ws, sync);
+});
+
+class AppLifecycleManager with WidgetsBindingObserver {
+  final WebSocketService _wsService;
+  final SyncEngine _syncEngine;
+
+  AppLifecycleManager(this._wsService, this._syncEngine) {
+    WidgetsBinding.instance.addObserver(this);
+    LoggerService.instance.info('LIFECYCLE', 'Central App Lifecycle Manager registered.');
+  }
+
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    LoggerService.instance.info('LIFECYCLE', 'Central App Lifecycle Manager unregistered.');
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    LoggerService.instance.info('LIFECYCLE', 'App state changed directly to: \$state');
+
+    switch (state) {
+      case AppLifecycleState.resumed:
+        LoggerService.instance.info('LIFECYCLE', 'Application returned from foreground. Reconnecting websocket channels & starting background delta synchronization sync.');
+        _wsService.connect();
+        _syncEngine.triggerSync();
+        break;
+      case AppLifecycleState.paused:
+        LoggerService.instance.info('LIFECYCLE', 'Application entered state paused in background. Shutting down websockets and suspension-unsafe timers.');
+        _wsService.disconnect();
+        break;
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.detached:
+        // No-op or lightweight buffer writes
+        break;
+      default:
+        break;
+    }
   }
 }`
   }
