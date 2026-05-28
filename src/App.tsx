@@ -880,6 +880,74 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
+                <div className="border-t border-slate-800/80 pt-2.5 space-y-1">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block">Realtime Tasks Operations:</span>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: task.created -> 'Опрос родственников пропавшего в СНТ Сосновый Бор'.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "task.created",
+                            task_id: "task_101",
+                            title: "Опрос родственников",
+                            search_id: "search_703",
+                            priority: "critical",
+                            created_at: new Date().toISOString()
+                          })
+                        );
+                        setDriftDatabaseSize(prev => parseFloat((prev + 0.12).toFixed(2)));
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-purple-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Plus className="w-2.5 h-2.5" />
+                      WS Create Task
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: task.assigned -> Task 'Опрос родственников' allocated to Заря-4.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "task.assigned",
+                            task_id: "task_101",
+                            assigned_volunteer_id: "vol_44",
+                            assigned_callsign: "Заря-4 (Иванова)",
+                            assigned_at: new Date().toISOString()
+                          })
+                        );
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-rose-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      WS Assign Task
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: task.status.changed -> Task 'Опрос родственников' marked COMPLETED.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "task.status.changed",
+                            task_id: "task_101",
+                            status: "completed",
+                            completed_at: new Date().toISOString()
+                          })
+                        );
+                        setDriftDatabaseSize(prev => parseFloat((prev + 0.04).toFixed(2)));
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-emerald-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      WS Complete Task
+                    </button>
+                  </div>
+                </div>
               </div>
 
             </div>

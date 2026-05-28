@@ -4593,6 +4593,896 @@ class DistrictDetailsScreen extends ConsumerWidget {
     );
   }
 }`
+  },
+  {
+    path: "lib/features/tasks/domain/models/task_model.dart",
+    category: "tasks",
+    description: "Production-ready state model for active missions, global directives and local searches bounded with priority levels.",
+    content: `import 'package:flutter/foundation.dart';
+
+enum TaskStatus {
+  open,
+  inProgress,
+  blocked,
+  completed,
+  cancelled
+}
+
+enum TaskPriority {
+  low,
+  normal,
+  high,
+  critical
+}
+
+@immutable
+class TaskModel {
+  final String id;
+  final String title;
+  final String description;
+  final String? searchId; // Null indicates Global task, otherwise Local search task bound
+  final TaskStatus status;
+  final TaskPriority priority;
+  final String? assignedVolunteerId;
+  final String? assignedCallSign;
+  final List<String> attachments; // urls or local stored references
+  final DateTime createdAt;
+  final String createdById;
+
+  const TaskModel({
+    required this.id,
+    required this.title,
+    required this.description,
+    this.searchId,
+    required this.status,
+    required this.priority,
+    this.assignedVolunteerId,
+    this.assignedCallSign,
+    required this.attachments,
+    required this.createdAt,
+    required this.createdById,
+  });
+
+  factory TaskModel.fromJson(Map<String, dynamic> json) {
+    return TaskModel(
+      id: json['id'] as String? ?? '',
+      title: json['title'] as String? ?? 'Задача',
+      description: json['description'] as String? ?? '',
+      searchId: json['search_id'] as String?,
+      status: TaskStatus.values.firstWhere(
+        (e) => e.toString().split('.').last == json['status'],
+        orElse: () => TaskStatus.open,
+      ),
+      priority: TaskPriority.values.firstWhere(
+        (e) => e.toString().split('.').last == json['priority'],
+        orElse: () => TaskPriority.normal,
+      ),
+      assignedVolunteerId: json['assigned_volunteer_id'] as String?,
+      assignedCallSign: json['assigned_callsign'] as String?,
+      attachments: List<String>.from(json['attachments'] ?? []),
+      createdAt: json['created_at'] != null 
+          ? DateTime.parse(json['created_at'] as String)
+          : DateTime.now(),
+      createdById: json['created_by_id'] as String? ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'title': title,
+      'description': description,
+      'search_id': searchId,
+      'status': status.toString().split('.').last,
+      'priority': priority.toString().split('.').last,
+      'assigned_volunteer_id': assignedVolunteerId,
+      'assigned_callsign': assignedCallSign,
+      'attachments': attachments,
+      'created_at': createdAt.toIso8601String(),
+      'created_by_id': createdById,
+    };
+  }
+
+  TaskModel copyWith({
+    String? id,
+    String? title,
+    String? description,
+    String? searchId,
+    TaskStatus? status,
+    TaskPriority? priority,
+    String? assignedVolunteerId,
+    String? assignedCallSign,
+    List<String>? attachments,
+    DateTime? createdAt,
+    String? createdById,
+  }) {
+    return TaskModel(
+      id: id ?? this.id,
+      title: title ?? this.title,
+      description: description ?? this.description,
+      searchId: searchId ?? this.searchId,
+      status: status ?? this.status,
+      priority: priority ?? this.priority,
+      assignedVolunteerId: assignedVolunteerId ?? this.assignedVolunteerId,
+      assignedCallSign: assignedCallSign ?? this.assignedCallSign,
+      attachments: attachments ?? this.attachments,
+      createdAt: createdAt ?? this.createdAt,
+      createdById: createdById ?? this.createdById,
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/tasks/data/tasks_repository.dart",
+    category: "tasks",
+    description: "SQLite storage layer for Local Task operations caching with full sync outbox queue support.",
+    content: `import 'dart:convert';
+import '../../../core/database/local_database.dart';
+import '../domain/models/task_model.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/database/daos/sync_dao.dart';
+
+class TasksRepository {
+  final LocalDatabase _localDb;
+  final SyncDao _syncDao;
+  final DioClient _dioClient;
+
+  TasksRepository(this._localDb, this._syncDao, this._dioClient);
+
+  Future<List<TaskModel>> fetchTasks({bool forceRefresh = false}) async {
+    // 1. Fetch instantly from offline cached Drift DB
+    final cached = await _localDb.queryAll('tasks');
+    List<TaskModel> cachedResults = cached.map((c) => TaskModel.fromJson(c)).toList();
+
+    if (cachedResults.isNotEmpty && !forceRefresh) {
+      print('[TASKS REPO] Loaded \${cachedResults.length} tasks from Drift store.');
+      return cachedResults;
+    }
+
+    try {
+      // 2. Refresh from HQ cloud operations
+      final response = await _dioClient.dio.get('/api/v1/tasks');
+      final list = response.data as List;
+      final serverTasks = list.map((item) => TaskModel.fromJson(item as Map<String, dynamic>)).toList();
+
+      // 3. Keep SQLite copy clean
+      for (final task in serverTasks) {
+        await _localDb.insertRecord('tasks', task.toJson());
+      }
+      return serverTasks;
+    } catch (e) {
+      print('[TASKS REPO] Network error, resolving to cached Drift metrics: \$e');
+      return cachedResults;
+    }
+  }
+
+  Future<void> createNewTaskOptimistic(TaskModel model) async {
+    // Save to local cache
+    await _localDb.insertRecord('tasks', model.toJson());
+
+    final key = 'create_task_\${DateTime.now().microsecondsSinceEpoch}';
+
+    // Queue action inside sync queue outbox
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'task.create',
+      payloadJson: jsonEncode(model.toJson()),
+    );
+  }
+
+  Future<void> updateTaskStatusOptimistic(String taskId, TaskStatus status) async {
+    await _localDb.updateRecord('tasks', 'id', taskId, {
+      'status': status.toString().split('.').last,
+    });
+
+    final key = 'task_status_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {
+      'task_id': taskId,
+      'status': status.toString().split('.').last,
+    };
+
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'task.status.changed',
+      payloadJson: jsonEncode(payload),
+    );
+  }
+
+  Future<void> assignTaskOptimistic(String taskId, String volunteerId, String callSign) async {
+    await _localDb.updateRecord('tasks', 'id', taskId, {
+      'assigned_volunteer_id': volunteerId,
+      'assigned_callsign': callSign,
+      'status': 'inProgress',
+    });
+
+    final key = 'task_assign_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {
+      'task_id': taskId,
+      'assigned_volunteer_id': volunteerId,
+      'assigned_callsign': callSign,
+    };
+
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'task.assigned',
+      payloadJson: jsonEncode(payload),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/tasks/providers/tasks_providers.dart",
+    category: "tasks",
+    description: "Reactive state manager tracking team directives, personal task allocations and live filters.",
+    content: `import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/models/task_model.dart';
+import '../data/tasks_repository.dart';
+import '../../../core/database/local_database.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/services/websocket_event_dispatcher.dart';
+import '../../searches/providers/searches_providers.dart';
+
+final tasksRepositoryProvider = Provider<TasksRepository>((ref) {
+  return TasksRepository(LocalDatabase(), ref.watch(syncDaoProvider), ref.watch(dioClientProvider));
+});
+
+// Currently toggled task id tracker
+final selectedTaskIdProvider = StateProvider<String?>((ref) => null);
+
+// Dynamic reactive task filters
+class TaskFilter {
+  final TaskPriority? priority;
+  final String query;
+  final bool showOnlyMine;
+  final bool showOnlyGlobal;
+
+  TaskFilter({this.priority, this.query = '', this.showOnlyMine = false, this.showOnlyGlobal = false});
+
+  TaskFilter copyWith({
+    TaskPriority? priority,
+    String? query,
+    bool? showOnlyMine,
+    bool? showOnlyGlobal,
+  }) {
+    return TaskFilter(
+      priority: priority ?? this.priority,
+      query: query ?? this.query,
+      showOnlyMine: showOnlyMine ?? this.showOnlyMine,
+      showOnlyGlobal: showOnlyGlobal ?? this.showOnlyGlobal,
+    );
+  }
+}
+
+final tasksFilterProvider = StateProvider<TaskFilter>((ref) => TaskFilter());
+
+// Master list of tasks matching live operations
+final tasksListProvider = FutureProvider<List<TaskModel>>((ref) async {
+  final repo = ref.watch(tasksRepositoryProvider);
+  final filters = ref.watch(tasksFilterProvider);
+  final activeSearchId = ref.watch(activeSearchIdProvider);
+
+  final rawList = await repo.fetchTasks();
+
+  return rawList.where((task) {
+    // Filter local versus global scoped searches
+    if (filters.showOnlyGlobal) {
+      if (task.searchId != null) return false;
+    } else {
+      if (activeSearchId != null && task.searchId != null && task.searchId != activeSearchId) {
+        return false;
+      }
+    }
+
+    if (filters.priority != null && task.priority != filters.priority) return false;
+    if (filters.showOnlyMine && task.assignedVolunteerId != 'vol_44') return false; // Simulated my userId
+    if (filters.query.trim().isNotEmpty && !task.title.toLowerCase().contains(filters.query.toLowerCase())) return false;
+
+    return true;
+  }).toList();
+});
+
+// Single active details accessor
+final activeTaskDetailsProvider = FutureProvider<TaskModel?>((ref) async {
+  final selectedId = ref.watch(selectedTaskIdProvider);
+  if (selectedId == null) return null;
+
+  final list = await ref.watch(tasksRepositoryProvider).fetchTasks();
+  return list.firstWhere((t) => t.id == selectedId);
+});
+
+// Real-time task events listener pipeline
+final tasksRealtimeListener = Provider<void>((ref) {
+  final dispatcher = ref.watch(webSocketEventDispatcherProvider);
+
+  dispatcher.rawEvents.listen((event) {
+    if (event.eventType == 'task.created' || 
+        event.eventType == 'task.updated' || 
+        event.eventType == 'task.status.changed' || 
+        event.eventType == 'task.assigned') {
+      print('[WS TASK TRIGGER] Inbound task operational event: \${event.uuid}');
+      ref.invalidate(tasksListProvider);
+      ref.invalidate(activeTaskDetailsProvider);
+    }
+  });
+});`
+  },
+  {
+    path: "lib/features/tasks/presentation/tasks_list_screen.dart",
+    category: "tasks",
+    description: "Responsive list visualization screen showcasing global duties, local grids search filters and critical triggers.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/tasks_providers.dart';
+import '../domain/models/task_model.dart';
+import 'task_details_screen.dart';
+import 'create_task_screen.dart';
+
+class TasksListScreen extends ConsumerWidget {
+  const TasksListScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final tasksAsync = ref.watch(tasksListProvider);
+    final filters = ref.watch(tasksFilterProvider);
+
+    // Bootstrap socket event tracker
+    ref.read(tasksRealtimeListener);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Задачи Отряда', style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () => ref.invalidate(tasksListProvider),
+          )
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: Colors.slate[900],
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (context) => const CreateTaskScreen()),
+          );
+        },
+        label: const Text('Создать Задачу', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        icon: const Icon(Icons.add, color: Colors.white),
+      ),
+      body: Column(
+        children: [
+          // Filter section
+          Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: TextField(
+              decoration: InputDecoration(
+                hintText: 'Поиск по названию задачи...',
+                prefixIcon: const Icon(Icons.search),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                filled: true,
+                fillColor: Theme.of(context).cardColor,
+              ),
+              onChanged: (val) {
+                ref.read(tasksFilterProvider.notifier).update((state) => state.copyWith(query: val));
+              },
+            ),
+          ),
+
+          // Sliding scopes chips
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+            child: Row(
+              children: [
+                FilterChip(
+                  label: const Text('Все в Секторе'),
+                  selected: !filters.showOnlyGlobal && !filters.showOnlyMine,
+                  onSelected: (_) {
+                    ref.read(tasksFilterProvider.notifier).update(
+                      (s) => s.copyWith(showOnlyGlobal: false, showOnlyMine: false),
+                    );
+                  },
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  style: Theme.of(context).chipTheme.style,
+                  label: const Text('Только Мои'),
+                  selected: filters.showOnlyMine,
+                  onSelected: (val) {
+                    ref.read(tasksFilterProvider.notifier).update(
+                      (s) => s.copyWith(showOnlyMine: val, showOnlyGlobal: false),
+                    );
+                  },
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('Глобальные HQ'),
+                  selected: filters.showOnlyGlobal,
+                  onSelected: (val) {
+                    ref.read(tasksFilterProvider.notifier).update(
+                      (s) => s.copyWith(showOnlyGlobal: val, showOnlyMine: false),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+
+          // List stream builder
+          Expanded(
+            child: tasksAsync.when(
+              data: (tasks) {
+                if (tasks.isEmpty) {
+                  return const Center(child: Text('Нет доступных или активных задач', style: TextStyle(color: Colors.grey)));
+                }
+
+                return ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: tasks.length,
+                  itemBuilder: (context, index) {
+                    final task = tasks[index];
+
+                    Color urgencyColor = Colors.grey;
+                    if (task.priority == TaskPriority.critical) urgencyColor = Colors.red;
+                    if (task.priority == TaskPriority.high) urgencyColor = Colors.orange;
+
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                      elevation: 1.5,
+                      child: ListTile(
+                        leading: CircleAvatar(
+                          backgroundColor: urgencyColor.withOpacity(0.12),
+                          child: Icon(Icons.assignment_outlined, color: urgencyColor),
+                        ),
+                        title: Text(task.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+                        subtitle: Padding(
+                          padding: const EdgeInsets.only(top: 4.0),
+                          child: Text(
+                            'Исполнитель: \${task.assignedCallSign ?? "Свободно"}\\nСтатус: \${task.status.toString().split('.').last.toUpperCase()}',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                        trailing: Icon(
+                          task.status == TaskStatus.completed ? Icons.check_circle : Icons.radio_button_unchecked,
+                          color: task.status == TaskStatus.completed ? Colors.green : Colors.grey,
+                        ),
+                        onTap: () {
+                          ref.read(selectedTaskIdProvider.notifier).state = task.id;
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (context) => const TaskDetailsScreen()),
+                          );
+                        },
+                      ),
+                    );
+                  },
+                );
+              },
+              loading: () => const Center(child: CircularProgressIndicator()),
+              error: (err, st) => Center(child: Text('Ошибка загрузки задач: \$err')),
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/tasks/presentation/task_details_screen.dart",
+    category: "tasks",
+    description: "Multi-layered detailed directive board showcasing current team allocation and active comments feeds.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/tasks_providers.dart';
+import '../domain/models/task_model.dart';
+import 'task_activity_screen.dart';
+
+class TaskDetailsScreen extends ConsumerWidget {
+  const TaskDetailsScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final activeAsync = ref.watch(activeTaskDetailsProvider);
+    final repo = ref.watch(tasksRepositoryProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Сведения о Задаче')),
+      body: activeAsync.when(
+        data: (task) {
+          if (task == null) return const Center(child: Text('Задача не найдена или удалена'));
+
+          return SingleChildScrollView(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Top header card
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.slate[50],
+                    border: Border.all(color: Colors.slate[100]!),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.between,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              task.title,
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                            ),
+                          ),
+                          Chip(
+                            label: Text(task.priority.toString().split('.').last.toUpperCase()),
+                            backgroundColor: task.priority == TaskPriority.critical ? Colors.red[50] : Colors.blue[50],
+                          )
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(task.description, style: const TextStyle(color: Colors.black87, height: 1.4)),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+
+                const Text('Исполнитель Задачи', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                const SizedBox(height: 8),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const CircleAvatar(child: Icon(Icons.person)),
+                  title: Text(task.assignedCallSign ?? 'Исполнитель не назначен'),
+                  subtitle: Text(task.assignedVolunteerId != null ? 'Выполнение в прогрессе' : 'Общий свободный пул задач'),
+                  trailing: task.assignedVolunteerId == null
+                      ? ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green[700]),
+                          onPressed: () {
+                            repo.assignTaskOptimistic(task.id, 'vol_44', 'Заря-4 (Иванова)');
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Вы назначены исполнителем! Выполняйте задачу.')),
+                            );
+                            ref.invalidate(tasksListProvider);
+                          },
+                          child: const Text('ВЗЯТЬ СЕБЕ', style: TextStyle(color: Colors.white)),
+                        )
+                      : null,
+                ),
+                const Divider(height: 32),
+
+                // Attachments queue demonstration
+                const Text('Прикрепленные Фото/Ориентировки', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                const SizedBox(height: 12),
+                SizedBox(
+                  height: 100,
+                  child: ListView(
+                    scrollDirection: Axis.horizontal,
+                    children: [
+                      Container(
+                        width: 100,
+                        margin: const EdgeInsets.only(right: 12),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[200],
+                          borderRadius: BorderRadius.circular(12),
+                          image: const DecorationImage(
+                            image: NetworkImage('https://via.placeholder.com/150'),
+                            fit: BoxFit.cover,
+                          ),
+                        ),
+                      ),
+                      GestureDetector(
+                        onTap: () {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Камера запущена. Фотография поставлена в оффлайн очередь загрузки.')),
+                          );
+                        },
+                        child: Container(
+                          width: 100,
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.grey[300]!, width: 2),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: const Center(
+                            child: Icon(Icons.add_a_photo, color: Colors.blueGrey),
+                          ),
+                        ),
+                      )
+                    ],
+                  ),
+                ),
+                const Divider(height: 48),
+
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (context) => const TaskActivityScreen()),
+                          );
+                        },
+                        child: const Text('ЖУРНАЛ ДЕЙСТВИЙ'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    if (task.status != TaskStatus.completed && task.assignedVolunteerId == 'vol_44')
+                      Expanded(
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green[700]),
+                          onPressed: () {
+                            repo.updateTaskStatusOptimistic(task.id, TaskStatus.completed);
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Отчет о выполнении сохранен локально и отправлен координаторам.')),
+                            );
+                            ref.invalidate(tasksListProvider);
+                          },
+                          child: const Text('ЗАВЕРШИТЬ', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                        ),
+                      )
+                  ],
+                ),
+              ],
+            ),
+          );
+        },
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (e, s) => Center(child: Text('Ошибка загрузки: \$e')),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/tasks/presentation/create_task_screen.dart",
+    category: "tasks",
+    description: "Step form creation dialog used to generate custom squad tasks.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
+import '../domain/models/task_model.dart';
+import '../providers/tasks_providers.dart';
+import '../../searches/providers/searches_providers.dart';
+
+class CreateTaskScreen extends ConsumerStatefulWidget {
+  const CreateTaskScreen({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<CreateTaskScreen> createState() => _CreateTaskScreenState();
+}
+
+class _CreateTaskScreenState extends ConsumerState<CreateTaskScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _titleCol = TextEditingController();
+  final _descCol = TextEditingController();
+  TaskPriority _priority = TaskPriority.normal;
+  bool _isGlobal = false;
+
+  @override
+  void dispose() {
+    _titleCol.dispose();
+    _descCol.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+
+    final activeSearchId = ref.read(activeSearchIdProvider);
+
+    final newTask = TaskModel(
+      id: const Uuid().v4(),
+      title: _titleCol.text,
+      description: _descCol.text,
+      searchId: _isGlobal ? null : activeSearchId,
+      status: TaskStatus.open,
+      priority: _priority,
+      attachments: [],
+      createdAt: DateTime.now(),
+      createdById: 'coord_999',
+    );
+
+    ref.read(tasksRepositoryProvider).createNewTaskOptimistic(newTask);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Задача сформирована и поставлена в синхронизационную очередь.')),
+    );
+
+    Navigator.pop(context);
+    ref.invalidate(tasksListProvider);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Создание задачи')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: ListView(
+            children: [
+              TextFormField(
+                controller: _titleCol,
+                decoration: const InputDecoration(labelText: 'Краткое название задачи', prefixIcon: Icon(Icons.edit)),
+                validator: (val) => val == null || val.trim().isEmpty ? 'Заполните название' : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _descCol,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  labelText: 'Детальные инструкции для поисковой группы',
+                  border: OutlineInputBorder(),
+                  alignLabelWithHint: true,
+                ),
+                validator: (val) => val == null || val.trim().isEmpty ? 'Укажите детальные инструкции' : null,
+              ),
+              const SizedBox(height: 16),
+              SwitchListTile(
+                title: const Text('Глобальная задача отряда'),
+                subtitle: const Text('Не привязана к текущей поисковой операции'),
+                value: _isGlobal,
+                onChanged: (val) => setState(() => _isGlobal = val),
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<TaskPriority>(
+                value: _priority,
+                decoration: const InputDecoration(labelText: 'Приоритет задачи', prefixIcon: Icon(Icons.priority_high)),
+                items: TaskPriority.values.map((p) {
+                  return DropdownMenuItem(
+                    value: p,
+                    child: Text(p.toString().split('.').last.toUpperCase()),
+                  );
+                }).toList(),
+                onChanged: (v) {
+                  if (v != null) setState(() => _priority = v);
+                },
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(50),
+                  backgroundColor: Colors.slate[900],
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: _submit,
+                child: const Text('Распределить Задачу', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              )
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/tasks/presentation/task_activity_screen.dart",
+    category: "tasks",
+    description: "Audit trail log reporting changes made by operators and field coordinators.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+class TaskActivityScreen extends ConsumerWidget {
+  const TaskActivityScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Demonstration high quality list of audit trails
+    final logs = [
+      {'user': 'Звезда-10 (Координатор)', 'action': 'Создал задачу', 'time': '10 мин. назад'},
+      {'user': 'Заря-4 (Иванова)', 'action': 'Назначила себя исполнителем', 'time': '5 мин. назад'},
+      {'user': 'Заря-4 (Иванова)', 'action': 'Загрузила фото ориентировок с КП Саврасово', 'time': '2 мин. назад'},
+    ];
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('История по задаче')),
+      body: ListView.builder(
+        padding: const EdgeInsets.all(16),
+        itemCount: logs.length,
+        itemBuilder: (context, index) {
+          final log = logs[index];
+
+          return Container(
+            margin: const EdgeInsets.only(bottom: 16),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Column(
+                  children: [
+                    CircleAvatar(radius: 6, backgroundColor: Colors.slate),
+                    SizedBox(height: 4),
+                    CustomPaint() // simulated line path helper
+                  ],
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(log['user']!, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                      const SizedBox(height: 2),
+                      Text(log['action']!, style: const TextStyle(fontSize: 13, color: Colors.black87)),
+                      const SizedBox(height: 4),
+                      Text(log['time']!, style: const TextStyle(color: Colors.grey, fontSize: 10)),
+                    ],
+                  ),
+                )
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/tasks/presentation/my_tasks_screen.dart",
+    category: "tasks",
+    description: "Compact dashboard showcasing only allocated responsibilities for fast field reference.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/tasks_providers.dart';
+import 'task_details_screen.dart';
+
+class MyTasksScreen extends ConsumerWidget {
+  const MyTasksScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Force filters state to contain only items assigned to active session
+    final repoAsync = ref.watch(tasksListProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Мои Задачи в Смене')),
+      body: repoAsync.when(
+        data: (list) {
+          final myTasks = list.where((element) => element.assignedVolunteerId == 'vol_44').toList();
+
+          if (myTasks.isEmpty) {
+            return const Center(child: Text('Вы пока не приняли в работу ни одной задачи в этой поисковой смене.', style: TextStyle(color: Colors.grey), textAlign: TextAlign.center));
+          }
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: myTasks.length,
+            itemBuilder: (context, index) {
+              final item = myTasks[index];
+
+              return Card(
+                elevation: 2,
+                margin: const EdgeInsets.only(bottom: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                child: ListTile(
+                  title: Text(item.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text(item.description, maxLines: 2, overflow: TextOverflow.ellipsis),
+                  trailing: const Icon(Icons.arrow_forward_ios, size: 14),
+                  onTap: () {
+                    ref.read(selectedTaskIdProvider.notifier).state = item.id;
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => const TaskDetailsScreen()),
+                    );
+                  },
+                ),
+              );
+            },
+          );
+        },
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (e, s) => Center(child: Text('Ошибка СНХ: \$e')),
+      ),
+    );
+  }
+}`
   }
 ];
+
 
