@@ -5482,6 +5482,878 @@ class MyTasksScreen extends ConsumerWidget {
     );
   }
 }`
+  },
+  {
+    path: "lib/features/chat/domain/models/chat_model.dart",
+    category: "chat",
+    description: "Multi-channel chat representation matching operational searches and private channels.",
+    content: `enum ChatType {
+  search,
+  direct,
+  system
+}
+
+class ChatRoomModel {
+  final String id;
+  final String title;
+  final ChatType type;
+  final String? searchId;
+  final String? lastMessageText;
+  final DateTime? lastMessageTime;
+  final int unreadCount;
+
+  const ChatRoomModel({
+    required this.id,
+    required this.title,
+    required this.type,
+    this.searchId,
+    this.lastMessageText,
+    this.lastMessageTime,
+    required this.unreadCount,
+  });
+
+  factory ChatRoomModel.fromJson(Map<String, dynamic> json) {
+    return ChatRoomModel(
+      id: json['id'] as String? ?? '',
+      title: json['title'] as String? ?? 'Канал связи',
+      type: ChatType.values.firstWhere(
+        (e) => e.toString().split('.').last == json['type'],
+        orElse: () => ChatType.search,
+      ),
+      searchId: json['search_id'] as String?,
+      lastMessageText: json['last_message_text'] as String?,
+      lastMessageTime: json['last_message_time'] != null 
+          ? DateTime.parse(json['last_message_time'] as String)
+          : null,
+      unreadCount: json['unread_count'] as int? ?? 0,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'title': title,
+      'type': type.toString().split('.').last,
+      'search_id': searchId,
+      'last_message_text': lastMessageText,
+      'last_message_time': lastMessageTime?.toIso8601String(),
+      'unread_count': unreadCount,
+    };
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/domain/models/message_model.dart",
+    category: "chat",
+    description: "Strictly typed chat messages supporting audio waveforms, circular video notes and Whisper speech transcripts.",
+    content: `enum MessageType {
+  text,
+  image,
+  video,
+  voice,
+  videoNote,
+  file,
+  liveLocation,
+  system
+}
+
+enum MessageStatus {
+  pending,
+  sent,
+  delivered,
+  read,
+  failed
+}
+
+class MessageModel {
+  final String id;
+  final String chatRoomId;
+  final String senderId;
+  final String senderCallSign;
+  final String content;
+  final MessageType type;
+  final MessageStatus status;
+  final String? mediaUrl;
+  final String? voiceTranscription;
+  final double? latitude;
+  final double? longitude;
+  final DateTime createdAt;
+
+  const MessageModel({
+    required this.id,
+    required this.chatRoomId,
+    required this.senderId,
+    required this.senderCallSign,
+    required this.content,
+    required this.type,
+    required this.status,
+    this.mediaUrl,
+    this.voiceTranscription,
+    this.latitude,
+    this.longitude,
+    required this.createdAt,
+  });
+
+  factory MessageModel.fromJson(Map<String, dynamic> json) {
+    return MessageModel(
+      id: json['id'] as String? ?? '',
+      chatRoomId: json['room_id'] as String? ?? '',
+      senderId: json['sender_id'] as String? ?? '',
+      senderCallSign: json['sender_callsign'] as String? ?? 'Спасатель',
+      content: json['content'] as String? ?? '',
+      type: MessageType.values.firstWhere(
+        (e) => e.toString().split('.').last == json['message_type'],
+        orElse: () => MessageType.text,
+      ),
+      status: MessageStatus.values.firstWhere(
+        (e) => e.toString().split('.').last == json['status'],
+        orElse: () => MessageStatus.sent,
+      ),
+      mediaUrl: json['media_url'] as String?,
+      voiceTranscription: json['voice_transcription'] as String?,
+      latitude: (json['latitude'] as num?)?.toDouble(),
+      longitude: (json['longitude'] as num?)?.toDouble(),
+      createdAt: json['created_at'] != null 
+          ? DateTime.parse(json['created_at'] as String)
+          : DateTime.now(),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'room_id': chatRoomId,
+      'sender_id': senderId,
+      'sender_callsign': senderCallSign,
+      'content': content,
+      'message_type': type.toString().split('.').last,
+      'status': status.toString().split('.').last,
+      'media_url': mediaUrl,
+      'voice_transcription': voiceTranscription,
+      'latitude': latitude,
+      'longitude': longitude,
+      'created_at': createdAt.toIso8601String(),
+    };
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/data/chat_repository.dart",
+    category: "chat",
+    description: "Local data source cache handling sequential messages delta synchronizations.",
+    content: `import 'dart:convert';
+import '../../../core/database/local_database.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/network/dio_client.dart';
+import '../domain/models/chat_model.dart';
+import '../domain/models/message_model.dart';
+
+class ChatRepository {
+  final LocalDatabase _localDb;
+  final SyncDao _syncDao;
+  final DioClient _dioClient;
+
+  ChatRepository(this._localDb, this._syncDao, this._dioClient);
+
+  Future<List<ChatRoomModel>> fetchRooms() async {
+    final cached = await _localDb.queryAll('chat_rooms');
+    List<ChatRoomModel> results = cached.map((c) => ChatRoomModel.fromJson(c)).toList();
+
+    if (results.isNotEmpty) {
+      print('[CHAT] Loaded \${results.length} channels from Drift database.');
+      return results;
+    }
+
+    try {
+      final response = await _dioClient.dio.get('/api/v1/chats');
+      final list = response.data as List;
+      final serverRooms = list.map((item) => ChatRoomModel.fromJson(item as Map<String, dynamic>)).toList();
+
+      for (final r in serverRooms) {
+        await _localDb.insertRecord('chat_rooms', r.toJson());
+      }
+      return serverRooms;
+    } catch (_) {
+      // Seed default rooms for high fidelity simulation
+      final seed = [
+        const ChatRoomModel(
+          id: 'room_search_24',
+          title: 'Поиск Артём К. (Общий чат)',
+          type: ChatType.search,
+          searchId: 's_cf34_new',
+          lastMessageText: 'Сбор через 10 минут у штаба.',
+          unreadCount: 2,
+        ),
+        const ChatRoomModel(
+          id: 'room_direct_coord',
+          title: 'Координатор (Связь штаба)',
+          type: ChatType.direct,
+          lastMessageText: 'Заявка принята, выдвигайтесь на А-1.',
+          unreadCount: 0,
+        ),
+      ];
+      for (final r in seed) {
+        await _localDb.insertRecord('chat_rooms', r.toJson());
+      }
+      return seed;
+    }
+  }
+
+  Future<List<MessageModel>> fetchMessages(String chatRoomId) async {
+    final cached = await _localDb.queryAll('chat_messages');
+    List<MessageModel> results = cached
+        .map((c) => MessageModel.fromJson(c))
+        .where((m) => m.chatRoomId == chatRoomId)
+        .toList();
+
+    if (results.isNotEmpty) return results;
+
+    final seed = [
+      MessageModel(
+        id: 'msg_seed_1',
+        chatRoomId: chatRoomId,
+        senderId: 'coord_999',
+        senderCallSign: 'Звезда-10 (Координатор)',
+        content: 'Внимание всем экипажам. Локализация поиска смещена на лесной массив Саврасово.',
+        type: MessageType.text,
+        status: MessageStatus.read,
+        createdAt: DateTime.now().subtract(const Duration(minutes: 15)),
+      ),
+      MessageModel(
+        id: 'msg_seed_2',
+        chatRoomId: chatRoomId,
+        senderId: 'vol_22',
+        senderCallSign: 'Амур-12',
+        content: 'Приборы зафиксировали подозрительные следы у оврага. Отправляю голосовой отчёт.',
+        type: MessageType.text,
+        status: MessageStatus.read,
+        createdAt: DateTime.now().subtract(const Duration(minutes: 10)),
+      ),
+      MessageModel(
+        id: 'msg_seed_3',
+        chatRoomId: chatRoomId,
+        senderId: 'vol_22',
+        senderCallSign: 'Амур-12',
+        content: 'Голосовой отчет о следах',
+        type: MessageType.voice,
+        status: MessageStatus.read,
+        mediaUrl: 'https://storage.rescuerhq.ru/voice/rec_242.aac',
+        voiceTranscription: 'Обнаружили детские следы обуви 32 размера у ручья. Движемся по правому склону.',
+        createdAt: DateTime.now().subtract(const Duration(minutes: 9)),
+      ),
+    ];
+
+    for (final m in seed) {
+      await _localDb.insertRecord('chat_messages', m.toJson());
+    }
+    return seed;
+  }
+
+  Future<void> sendTextMessageOptimistic({
+    required String chatRoomId,
+    required String text,
+    required String senderId,
+    required String senderCallSign,
+  }) async {
+    final newMsg = MessageModel(
+      id: 'msg_\${DateTime.now().microsecondsSinceEpoch}',
+      chatRoomId: chatRoomId,
+      senderId: senderId,
+      senderCallSign: senderCallSign,
+      content: text,
+      type: MessageType.text,
+      status: MessageStatus.pending,
+      createdAt: DateTime.now(),
+    );
+
+    await _localDb.insertRecord('chat_messages', newMsg.toJson());
+
+    final key = 'send_msg_\${DateTime.now().microsecondsSinceEpoch}';
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'chat.message.created',
+      payloadJson: jsonEncode(newMsg.toJson()),
+    );
+  }
+
+  Future<void> sendVoiceMessageOptimistic({
+    required String chatRoomId,
+    required String localPath,
+    required String textContent,
+    required String sttTranscription,
+  }) async {
+    final newMsg = MessageModel(
+      id: 'voice_msg_\${DateTime.now().microsecondsSinceEpoch}',
+      chatRoomId: chatRoomId,
+      senderId: 'vol_44',
+      senderCallSign: 'Заря-4 (Иванова)',
+      content: textContent,
+      type: MessageType.voice,
+      status: MessageStatus.pending,
+      mediaUrl: localPath,
+      voiceTranscription: sttTranscription,
+      createdAt: DateTime.now(),
+    );
+
+    await _localDb.insertRecord('chat_messages', newMsg.toJson());
+
+    final key = 'send_voice_\${DateTime.now().microsecondsSinceEpoch}';
+    await _syncDao.addToQueue(
+      idempotencyKey: key,
+      actionType: 'chat.message.voice.created',
+      payloadJson: jsonEncode(newMsg.toJson()),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/providers/chat_providers.dart",
+    category: "chat",
+    description: "Tracks active message thread feeds, typing indicators, active recordings status and STT events.",
+    content: `import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/models/chat_model.dart';
+import '../domain/models/message_model.dart';
+import '../data/chat_repository.dart';
+import '../../../core/database/local_database.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/services/websocket_event_dispatcher.dart';
+
+final chatRepositoryProvider = Provider<ChatRepository>((ref) {
+  return ChatRepository(LocalDatabase(), ref.watch(syncDaoProvider), ref.watch(dioClientProvider));
+});
+
+// Tracker of selected conversational screen ID
+final activeChatRoomIdProvider = StateProvider<String?>((ref) => null);
+
+// Streams available channels with live unread notifications
+final chatsRoomsListProvider = FutureProvider<List<ChatRoomModel>>((ref) async {
+  final repo = ref.watch(chatRepositoryProvider);
+  return repo.fetchRooms();
+});
+
+// Dynamic chat stream monitoring live deliveries
+final chatMessagesListProvider = FutureProvider<List<MessageModel>>((ref) async {
+  final activeRoomId = ref.watch(activeChatRoomIdProvider);
+  if (activeRoomId == null) return [];
+
+  final repo = ref.watch(chatRepositoryProvider);
+  return repo.fetchMessages(activeRoomId);
+});
+
+// Tracks instant typing broadcast announcements
+final typingUserCallsignProvider = StateProvider<String?>((ref) => null);
+
+// Synchronizes and merges socket communication streams
+final chatRealtimeSynchronizer = Provider<void>((ref) {
+  final dispatcher = ref.watch(webSocketEventDispatcherProvider);
+
+  dispatcher.rawEvents.listen((event) {
+    if (event.eventType == 'chat.message.created' || event.eventType == 'chat.read') {
+      ref.invalidate(chatMessagesListProvider);
+      ref.invalidate(chatsRoomsListProvider);
+    }
+
+    if (event.eventType == 'chat.typing') {
+      final payload = Map<String, dynamic>.from(event.payload);
+      ref.read(typingUserCallsignProvider.notifier).state = payload['callsign'] as String?;
+      
+      // Expire typing state status after 4 seconds
+      Future.delayed(const Duration(seconds: 4), () {
+        ref.read(typingUserCallsignProvider.notifier).state = null;
+      });
+    }
+  });
+});`
+  },
+  {
+    path: "lib/features/chat/presentation/chats_list_screen.dart",
+    category: "chat",
+    description: "Unified communication panel sorting organizational, group tactical and direct channels.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+    import '../providers/chat_providers.dart';
+import 'chat_screen.dart';
+
+class ChatsListScreen extends ConsumerWidget {
+  const ChatsListScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final roomsAsync = ref.watch(chatsRoomsListProvider);
+
+    // Turn on instant real-time websocket listener
+    ref.read(chatRealtimeSynchronizer);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Связь отряда и Чат', style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.sync),
+            onPressed: () => ref.invalidate(chatsRoomsListProvider),
+          )
+        ],
+      ),
+      body: roomsAsync.when(
+        data: (rooms) {
+          if (rooms.isEmpty) {
+            return const Center(child: Text('Нет активных каналов связи', style: TextStyle(color: Colors.grey)));
+          }
+
+          return ListView.builder(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            itemCount: rooms.length,
+            itemBuilder: (context, index) {
+              final room = rooms[index];
+
+              return ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: room.unreadCount > 0 ? Colors.red[50] : Colors.blueGrey[50],
+                  child: Icon(
+                    room.type == ChatType.search ? Icons.military_tech_outlined : Icons.forum_outlined,
+                    color: room.unreadCount > 0 ? Colors.red : Colors.blueGrey,
+                  ),
+                ),
+                title: Text(room.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text(
+                  room.lastMessageText ?? 'Сообщений пока нет',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                trailing: room.unreadCount > 0
+                    ? Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                        child: Text(
+                          room.unreadCount.toString(),
+                          style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                        ),
+                      )
+                    : const Icon(Icons.arrow_forward_ios, size: 12),
+                onTap: () {
+                  ref.read(activeChatRoomIdProvider.notifier).state = room.id;
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (context) => const ChatScreen()),
+                  );
+                },
+              );
+            },
+          );
+        },
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (err, st) => Center(child: Text('Ошибка СНХ: \$err')),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/presentation/chat_screen.dart",
+    category: "chat",
+    description: "Highly interactive conversation client featuring STT captions, bubbles and visual indicators.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/chat_providers.dart';
+import '../domain/models/message_model.dart';
+import 'widgets/voice_recorder_widget.dart';
+import 'widgets/live_location_widget.dart';
+import 'media_viewer_screen.dart';
+import 'chat_details_screen.dart';
+
+class ChatScreen extends ConsumerStatefulWidget {
+  const ChatScreen({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends ConsumerState<ChatScreen> {
+  final _inputController = TextEditingController();
+  final _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _inputController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _sendMessage() {
+    final text = _inputController.text.trim();
+    if (text.isEmpty) return;
+
+    final roomId = ref.read(activeChatRoomIdProvider);
+    if (roomId == null) return;
+
+    ref.read(chatRepositoryProvider).sendTextMessageOptimistic(
+      chatRoomId: roomId,
+      text: text,
+      senderId: 'vol_44',
+      senderCallSign: 'Заря-4 (Иванова)',
+    );
+
+    _inputController.clear();
+    ref.invalidate(chatMessagesListProvider);
+    
+    // Smooth scroll downwards
+    Future.delayed(const Duration(milliseconds: 200), () {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final messagesAsync = ref.watch(chatMessagesListProvider);
+    final typingUser = ref.watch(typingUserCallsignProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Сводный Радиообмен'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const ChatDetailsScreen()),
+              );
+            },
+          )
+        ],
+      ),
+      body: Column(
+        children: [
+          // Speech typing indication alert
+          if (typingUser != null)
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
+              color: Colors.blueGrey[50],
+              width: double.infinity,
+              child: Text(
+                '👤 \$typingUser вводит радиационный рапорт...',
+                style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: Colors.blueGrey),
+              ),
+            ),
+
+          Expanded(
+            child: messagesAsync.when(
+              data: (messages) {
+                if (messages.isEmpty) {
+                  return const Center(child: Text('Сообщения отсутствуют. Начните рапорт.'));
+                }
+
+                return ListView.builder(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: messages.length,
+                  itemBuilder: (context, index) {
+                    final msg = messages[index];
+                    final isMe = msg.senderId == 'vol_44';
+
+                    return Align(
+                      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        padding: const EdgeInsets.all(12),
+                        maxWidth: MediaQuery.of(context).size.width * 0.75,
+                        decoration: BoxDecoration(
+                          color: isMe ? Colors.slate[950] : Colors.blueGrey[50],
+                          borderRadius: BorderRadius.only(
+                            topLeft: const Radius.circular(16),
+                            topRight: const Radius.circular(16),
+                            bottomLeft: isMe ? const Radius.circular(16) : Radius.zero,
+                            bottomRight: isMe ? Radius.zero : const Radius.circular(16),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              msg.senderCallSign,
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 11,
+                                color: isMe ? Colors.redAccent : Colors.slate[800],
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            
+                            // Audio / Voice component with Speech-To-Text captions
+                            if (msg.type == MessageType.voice) ...[
+                              Row(
+                                children: [
+                                  Icon(Icons.play_circle_fill, color: isMe ? Colors.white : Colors.black87),
+                                  const SizedBox(width: 8),
+                                  const Expanded(child: LinearProgressIndicator(value: 0.35, color: Colors.red)),
+                                ],
+                              ),
+                              if (msg.voiceTranscription != null) ...[
+                                const SizedBox(height: 8),
+                                Container(
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    color: isMe ? Colors.white10 : Colors.white70,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(
+                                    'STT расшифровка Whisper:\\n"\${msg.voiceTranscription}"',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontStyle: FontStyle.italic,
+                                      color: isMe ? Colors.white70 : Colors.black87,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ] else if (msg.type == MessageType.liveLocation) ...[
+                              LiveLocationWidget(lat: msg.latitude ?? 55.75, lng: msg.longitude ?? 37.61)
+                            ] else ...[
+                              Text(
+                                msg.content,
+                                style: TextStyle(color: isMe ? Colors.white : Colors.black87),
+                              ),
+                            ],
+                            const SizedBox(height: 4),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  '\${msg.createdAt.hour}:\${msg.createdAt.minute.toString().padLeft(2, "0")}',
+                                  style: TextStyle(fontSize: 9, color: isMe ? Colors.white38 : Colors.grey),
+                                ),
+                                const SizedBox(width: 4),
+                                Icon(
+                                  msg.status == MessageStatus.pending ? Icons.access_time : Icons.done_all,
+                                  size: 11,
+                                  color: isMe ? Colors.white54 : Colors.grey,
+                                )
+                              ],
+                            )
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+              loading: () => const Center(child: CircularProgressIndicator()),
+              error: (e, s) => Center(child: Text('Ошибка ГИС: \$e')),
+            ),
+          ),
+
+          // Action input bar
+          SafeArea(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).cardColor,
+                border: const Border(top: BorderSide(color: Colors.black12)),
+              ),
+              child: Row(
+                children: [
+                  VoiceRecorderWidget(
+                    onRecorded: (path, durationText, whisperDetails) {
+                      ref.read(chatRepositoryProvider).sendVoiceMessageOptimistic(
+                        chatRoomId: ref.read(activeChatRoomIdProvider)!,
+                        localPath: path,
+                        textContent: durationText,
+                        sttTranscription: whisperDetails,
+                      );
+                      ref.invalidate(chatMessagesListProvider);
+                    },
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _inputController,
+                      decoration: const InputDecoration(
+                        hintText: 'Радиосообщение...',
+                        border: InputBorder.none,
+                      ),
+                      onSubmitted: (_) => _sendMessage(),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.send, color: Colors.blueAccent),
+                    onPressed: _sendMessage,
+                  )
+                ],
+              ),
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/presentation/widgets/voice_recorder_widget.dart",
+    category: "chat",
+    description: "Compact bottom sheets capturing voice messages and simulating immediate Whisper completions.",
+    content: `import 'package:flutter/material.dart';
+
+class VoiceRecorderWidget extends StatefulWidget {
+  final Function(String path, String durationText, String WhisperSTT) onRecorded;
+
+  const VoiceRecorderWidget({Key? key, required this.onRecorded}) : super(key: key);
+
+  @override
+  State<VoiceRecorderWidget> createState() => _VoiceRecorderWidgetState();
+}
+
+class _VoiceRecorderWidgetState extends State<VoiceRecorderWidget> {
+  bool _isRecording = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: () {
+        if (_isRecording) {
+          setState(() => _isRecording = false);
+          // Simulate voice completion and immediate Whisper transcript resolution
+          widget.onRecorded(
+            '/data/cache/voc_902.aac',
+            'Голосовое сообщение (0:08)',
+            'Прочесали квадрат Б-1. Никаких следов не обнаружено, запрашиваем перегруппировку.',
+          );
+        } else {
+          setState(() => _isRecording = true);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Внимание! Запись рации запущена.'), duration: Duration(seconds: 1)),
+          );
+        }
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: _isRecording ? Colors.redAccent : Colors.grey[200],
+          shape: BoxShape.circle,
+        ),
+        child: Icon(
+          _isRecording ? Icons.stop : Icons.mic,
+          color: _isRecording ? Colors.white : Colors.slate[800],
+          size: 20,
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/presentation/widgets/live_location_widget.dart",
+    category: "chat",
+    description: "Geopositional rendering preview embedding coordinate shapes into tactical message boxes.",
+    content: `import 'package:flutter/material.dart';
+
+class LiveLocationWidget extends StatelessWidget {
+  final double lat;
+  final double lng;
+
+  const LiveLocationWidget({Key? key, required this.lat, required this.lng}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 200,
+      height: 100,
+      decoration: BoxDecoration(
+        color: Colors.slate[900],
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.share_location, color: Colors.greenAccent, size: 28),
+            const SizedBox(height: 6),
+            const Text('Трансляция геопозиции', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+            Text('Коорд: \$lat • \$lng', style: const TextStyle(color: Colors.white60, fontSize: 10)),
+          ],
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/presentation/media_viewer_screen.dart",
+    category: "chat",
+    description: "Deep zoom viewer optimizing raw search evidences layout scales.",
+    content: `import 'package:flutter/material.dart';
+
+class MediaViewerScreen extends StatelessWidget {
+  final String path;
+
+  const MediaViewerScreen({Key? key, required this.path}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(backgroundColor: Colors.black, iconTheme: const IconThemeData(color: Colors.white)),
+      body: Center(
+        child: InteractiveViewer(
+          child: path.startsWith('http')
+              ? Image.network(path)
+              : const Center(child: Icon(Icons.broken_image, size: 60, color: Colors.white12)),
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/presentation/chat_details_screen.dart",
+    category: "chat",
+    description: "Detailed description of talk group with members listing and parameters catalog.",
+    content: `import 'package:flutter/material.dart';
+
+class ChatDetailsScreen extends StatelessWidget {
+  const ChatDetailsScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final participants = [
+      {'callsign': 'Звезда-10 (Координатор)', 'role': 'Руководитель смены'},
+      {'callsign': 'Заря-4 (Иванова)', 'role': 'Поисковый волонтер'},
+      {'callsign': 'Амур-12 (Соколов)', 'role': 'Расчет К9 кинолог'},
+    ];
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Сведения о радиоканале')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text('Канал вещания чата', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+          const SizedBox(height: 6),
+          const Text('Частотная сетка: 144.500 МГц (субтон 77.0)', style: TextStyle(color: Colors.blueGrey)),
+          const Divider(height: 32),
+          
+          const Text('Участники радиосети:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+          const SizedBox(height: 12),
+          ...participants.map((p) => ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: CircleAvatar(child: Text(p['callsign']![0])),
+            title: Text(p['callsign']!, style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text(p['role']!),
+          )).toList(),
+        ],
+      ),
+    );
+  }
+}`
   }
 ];
 

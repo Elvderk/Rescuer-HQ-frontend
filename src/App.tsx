@@ -948,6 +948,80 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
+                <div className="border-t border-slate-800/80 pt-2.5 space-y-1">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block">Realtime Radio & STT:</span>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: chat.typing -> 'Амур-12' starts transmitting radio report.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "chat.typing",
+                            room_id: "room_search_24",
+                            callsign: "Амур-12 (Кинолог)",
+                            is_typing: true
+                          })
+                        );
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-cyan-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Plus className="w-2.5 h-2.5 animate-pulse" />
+                      WS Typing On
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: chat.message.voice.created -> 'Амур-12' voice msg. Whisper STT resolved successfully.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "chat.message.created",
+                            room_id: "room_search_24",
+                            message_id: "msg_voice_842",
+                            sender_callsign: "Амур-12 (Кинолог)",
+                            message_type: "voice",
+                            media_url: "https://storage.rescuerhq.ru/voice/rec_99.aac",
+                            voice_transcription: "Собака взяла след у развилки тропы, движемся в северном направлении.",
+                            status: "delivered",
+                            created_at: new Date().toISOString()
+                          })
+                        );
+                        setDriftDatabaseSize(prev => parseFloat((prev + 0.18).toFixed(2)));
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-amber-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      WS Voice STT
+                    </button>
+                    <button
+                      onClick={() => {
+                        addSimEvent(
+                          "WS BROADCAST: live_location.updated -> 'Заря-4' gps track packet dispatched to GIS.",
+                          "status",
+                          "success",
+                          JSON.stringify({
+                            event: "live_location.updated",
+                            room_id: "room_search_24",
+                            message_id: "msg_gps_75",
+                            sender_callsign: "Заря-4 (Иванова)",
+                            message_type: "liveLocation",
+                            latitude: 55.7592,
+                            longitude: 37.6190,
+                            status: "read",
+                            created_at: new Date().toISOString()
+                          })
+                        );
+                      }}
+                      className="py-1 px-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-emerald-400 rounded text-[9px] font-mono flex items-center justify-center gap-1 transition-colors"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      WS Dispat GPS
+                    </button>
+                  </div>
+                </div>
               </div>
 
             </div>
