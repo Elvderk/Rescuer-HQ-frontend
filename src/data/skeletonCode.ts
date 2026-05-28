@@ -110,8 +110,12 @@ class RescuerHQApp extends ConsumerWidget {
 import 'package:go_router/go_router.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../features/auth/providers/auth_provider.dart';
+import '../../features/auth/providers/auth_notifier.dart';
+import '../../features/auth/domain/auth_state.dart';
 import '../../features/auth/presentation/login_screen.dart';
+import '../../features/auth/presentation/registration_request_screen.dart';
+import '../../features/auth/presentation/pending_approval_screen.dart';
+import '../../features/auth/presentation/session_loading_screen.dart';
 import '../../features/searches/presentation/searches_dashboard.dart';
 import '../../features/map/presentation/search_map_screen.dart';
 import '../../features/chat/presentation/chat_detail_screen.dart';
@@ -121,19 +125,52 @@ final routerProvider = Provider<GoRouter>((ref) {
   final authState = ref.watch(authProvider);
 
   return GoRouter(
-    initialLocation: '/searches',
+    initialLocation: '/loading',
     redirect: (context, state) {
-      final loggedIn = authState.isAuthenticated;
-      final loggingIn = state.matchedLocation == '/login';
+      final status = authState.status;
 
-      if (!loggedIn && !loggingIn) return '/login';
-      if (loggedIn && loggingIn) return '/searches';
+      // Ensure system loading completes before selecting any route
+      if (status == AuthStatus.uninitialized || status == AuthStatus.loading) {
+        if (state.matchedLocation != '/loading') return '/loading';
+        return null;
+      }
+
+      // Check for pending approval state
+      if (status == AuthStatus.pendingApproval) {
+        if (state.matchedLocation != '/pending') return '/pending';
+        return null;
+      }
+
+      // Handle unauthenticated routes
+      final isAuthRoute = state.matchedLocation == '/login' || state.matchedLocation == '/register-request';
+      if (status == AuthStatus.unauthenticated) {
+        if (!isAuthRoute) return '/login';
+        return null;
+      }
+
+      // Prevent authenticated users from visiting auth zones
+      if (status == AuthStatus.authenticated && isAuthRoute) {
+        return '/searches';
+      }
+
       return null;
     },
     routes: [
       GoRoute(
+        path: '/loading',
+        builder: (context, state) => const SessionLoadingScreen(),
+      ),
+      GoRoute(
         path: '/login',
         builder: (context, state) => const LoginScreen(),
+      ),
+      GoRoute(
+        path: '/register-request',
+        builder: (context, state) => const RegistrationRequestScreen(),
+      ),
+      GoRoute(
+        path: '/pending',
+        builder: (context, state) => const PendingApprovalScreen(),
       ),
       GoRoute(
         path: '/searches',
@@ -176,10 +213,8 @@ final routerProvider = Provider<GoRouter>((ref) {
     description: "Sophisticated HTTP/REST API client wraps Dio. Configures dynamic authorization headers, connection timeouts, queued refresh token retry loops, and robust error mappings.",
     content: `import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
-import '../navigation/app_router.dart';
-import '../../features/auth/providers/auth_provider.dart';
+import '../../features/auth/providers/auth_notifier.dart';
 
 final dioClientProvider = Provider<DioClient>((ref) {
   return DioClient(ref);
@@ -188,6 +223,8 @@ final dioClientProvider = Provider<DioClient>((ref) {
 class DioClient {
   final Ref _ref;
   late final Dio _dio;
+  bool _isRefreshing = false;
+  final List<Map<String, dynamic>> _retryQueue = [];
 
   Dio get dio => _dio;
 
@@ -207,39 +244,85 @@ class DioClient {
     _dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (options, handler) async {
-          final secureToken = await _ref.read(authProvider.notifier).getAccessToken();
-          if (secureToken != null) {
-            options.headers['Authorization'] = 'Bearer \$secureToken';
+          // Public routes bypass Authorization header embedding
+          final isPublic = options.path.contains('/auth/login') || options.path.contains('/auth/register-request');
+          if (!isPublic) {
+            final secureToken = await _ref.read(authProvider.notifier).getAccessToken();
+            if (secureToken != null) {
+              options.headers['Authorization'] = 'Bearer \$secureToken';
+            }
           }
           return handler.next(options);
         },
         onError: (DioException err, handler) async {
-          // Token Expiry Interception: 401 Unauthorized
-          if (err.response?.statusCode == 401) {
-            final success = await _ref.read(authProvider.notifier).rotateRefreshTokens();
-            if (success) {
-              // Retry the original request with new Access Token
-              final newAccessToken = await _ref.read(authProvider.notifier).getAccessToken();
-              err.requestOptions.headers['Authorization'] = 'Bearer \$newAccessToken';
-              
-              // Re-execute request with exact same options
-              final clonedRequest = await _dio.request(
-                err.requestOptions.path,
-                options: Options(
-                  method: err.requestOptions.method,
-                  headers: err.requestOptions.headers,
-                ),
-                data: err.requestOptions.data,
-                queryParameters: err.requestOptions.queryParameters,
-              );
-              return handler.resolve(clonedRequest);
-            } else {
-              // Rotation failed. Force user logout.
-              _ref.read(authProvider.notifier).logout();
+          // Catch HTTP 401 Unauthorized for accessToken expiry
+          if (err.response?.statusCode == 401 && !err.requestOptions.path.contains('/auth/login')) {
+            // Buffer the current request configuration to execute retry after rotation
+            final requestOptions = err.requestOptions;
+            
+            if (_isRefreshing) {
+              // Wait for active thread rotation by appending request to retry queue
+              _retryQueue.add({
+                'options': requestOptions,
+                'handler': handler,
+              });
+              return;
             }
+
+            // Acquire refresh lock thread indicator
+            _isRefreshing = true;
+
+            try {
+              final success = await _ref.read(authProvider.notifier).rotateRefreshTokens();
+              if (success) {
+                // Fetch the newly renewed access token
+                final newAccessToken = await _ref.read(authProvider.notifier).getAccessToken();
+                
+                // Replay the original triggered error request
+                requestOptions.headers['Authorization'] = 'Bearer \$newAccessToken';
+                final response = await _replayRequest(requestOptions);
+                handler.resolve(response);
+
+                // Replay all stacked parallel requests captured in the retry queue
+                for (final pendingRequest in _retryQueue) {
+                  final options = pendingRequest['options'] as RequestOptions;
+                  final pendingHandler = pendingRequest['handler'] as ErrorInterceptorHandler;
+                  
+                  options.headers['Authorization'] = 'Bearer \$newAccessToken';
+                  final pendingResponse = await _replayRequest(options);
+                  pendingHandler.resolve(pendingResponse);
+                }
+                
+                _retryQueue.clear();
+              } else {
+                _retryQueue.clear();
+                // Logout the volunteer forcibly due to refresh token expiry
+                _ref.read(authProvider.notifier).logout();
+                return handler.next(err);
+              }
+            } catch (retryError) {
+              _retryQueue.clear();
+              _ref.read(authProvider.notifier).logout();
+              return handler.next(err);
+            } finally {
+              _isRefreshing = false;
+            }
+            return;
           }
           return handler.next(err);
         },
+      ),
+    );
+  }
+
+  Future<Response> _replayRequest(RequestOptions options) {
+    return _dio.request(
+      options.path,
+      data: options.data,
+      queryParameters: options.queryParameters,
+      options: Options(
+        method: options.method,
+        headers: options.headers,
       ),
     );
   }
@@ -1048,112 +1131,1097 @@ class _CoordinationPanel extends ConsumerWidget {
 }`
   },
   {
-    path: "lib/features/auth/providers/auth_provider.dart",
+    path: "lib/features/auth/domain/user_profile_model.dart",
     category: "auth",
-    description: "JWT secure repository wrapper. Connects with secure storage modules holding active access tokens, handles permission sets, and locks role permissions before rendering routes.",
-    content: `import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+    description: "Declares User profile attributes, phone logs, credentials mapping, call signs and strict RBAC values.",
+    content: `import 'package:flutter/foundation.dart';
 
-import '../../../core/network/dio_client.dart';
-
-enum UserRole { volunteer, coordinator, seniorCoordinator, director, itAdmin }
-
-class AuthState {
-  final bool isAuthenticated;
-  final String? userId;
-  final UserRole? role;
-  final bool isLoading;
-
-  AuthState({
-    this.isAuthenticated = false,
-    this.userId,
-    this.role,
-    this.isLoading = false,
-  });
-
-  AuthState copyWith({
-    bool? isAuthenticated,
-    String? userId,
-    UserRole? role,
-    bool? isLoading,
-  }) {
-    return AuthState(
-      isAuthenticated: isAuthenticated ?? this.isAuthenticated,
-      userId: userId ?? this.userId,
-      role: role ?? this.role,
-      isLoading: isLoading ?? this.isLoading,
-    );
-  }
+enum UserRole {
+  volunteer,
+  operator,
+  coordinator,
+  seniorCoordinator,
+  director,
+  itAdmin
 }
 
-final authProvider = StateNotifierProvider<AuthNotifier, AuthState>((ref) {
-  return AuthNotifier();
-});
+enum ApprovalStatus {
+  pendingApproval,
+  approved,
+  rejected
+}
 
-class AuthNotifier extends StateNotifier<AuthState> {
-  final FlutterSecureStorage _storage = const FlutterSecureStorage();
+@immutable
+class UserProfileModel {
+  final String id;
+  final String givenName;
+  final String callSign; // Спасательный позывной волонтера
+  final String email;
+  final String phone;
+  final UserRole role;
+  final ApprovalStatus approvalStatus;
 
-  AuthNotifier() : super(AuthState()) {
-    _tryAutoLogin();
+  const UserProfileModel({
+    required this.id,
+    required this.givenName,
+    required this.callSign,
+    required this.email,
+    required this.phone,
+    required this.role,
+    required this.approvalStatus,
+  });
+
+  UserProfileModel copyWith({
+    String? id,
+    String? givenName,
+    String? callSign,
+    String? email,
+    String? phone,
+    UserRole? role,
+    ApprovalStatus? approvalStatus,
+  }) {
+    return UserProfileModel(
+      id: id ?? this.id,
+      givenName: givenName ?? this.givenName,
+      callSign: callSign ?? this.callSign,
+      email: email ?? this.email,
+      phone: phone ?? this.phone,
+      role: role ?? this.role,
+      approvalStatus: approvalStatus ?? this.approvalStatus,
+    );
   }
 
-  Future<void> _tryAutoLogin() async {
-    final token = await getAccessToken();
-    if (token != null) {
-      // Re-hydrate mock state, decoding JWT headers to parse claims
-      state = AuthState(
-        isAuthenticated: true,
-        userId: "913f99e4-fa86-4e5b-b9d9-95e3437ffcbd",
-        role: UserRole.coordinator,
-      );
+  factory UserProfileModel.fromJson(Map<String, dynamic> json) {
+    return UserProfileModel(
+      id: json['id'] as String,
+      givenName: json['given_name'] as String,
+      callSign: json['call_sign'] as String? ?? 'Volt-Unknown',
+      email: json['email'] as String,
+      phone: json['phone'] as String? ?? '',
+      role: _parseRole(json['role'] as String),
+      approvalStatus: _parseApprovalStatus(json['approval_status'] as String),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'given_name': givenName,
+      'call_sign': callSign,
+      'email': email,
+      'phone': phone,
+      'role': role.name,
+      'approval_status': approvalStatus.name,
+    };
+  }
+
+  static UserRole _parseRole(String roleStr) {
+    switch (roleStr.toLowerCase()) {
+      case 'director': return UserRole.director;
+      case 'seniorcoordinator':
+      case 'senior_coordinator': return UserRole.seniorCoordinator;
+      case 'it_admin':
+      case 'itadmin': return UserRole.itAdmin;
+      case 'coordinator': return UserRole.coordinator;
+      case 'operator': return UserRole.operator;
+      case 'volunteer':
+      default: return UserRole.volunteer;
     }
   }
 
-  Future<String?> getAccessToken() async {
-    return await _storage.read(key: "access_token");
+  static ApprovalStatus _parseApprovalStatus(String statusStr) {
+    switch (statusStr.toLowerCase()) {
+      case 'approved': return ApprovalStatus.approved;
+      case 'rejected': return ApprovalStatus.rejected;
+      case 'pending':
+      case 'pending_approval':
+      default: return ApprovalStatus.pendingApproval;
+    }
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/domain/auth_state.dart",
+    category: "auth",
+    description: "Declares auth state transitions and validation tracking variables.",
+    content: `import 'user_profile_model.dart';
+
+enum AuthStatus {
+  uninitialized,
+  loading,
+  unauthenticated,
+  pendingApproval,
+  authenticated,
+  error
+}
+
+class AuthState {
+  final AuthStatus status;
+  final UserProfileModel? user;
+  final String? errorMessage;
+
+  const AuthState({
+    this.status = AuthStatus.uninitialized,
+    this.user,
+    this.errorMessage,
+  });
+
+  bool get isAuthenticated => status == AuthStatus.authenticated;
+  bool get isLoading => status == AuthStatus.loading;
+  bool get isPendingApproval => status == AuthStatus.pendingApproval;
+
+  AuthState copyWith({
+    AuthStatus? status,
+    UserProfileModel? user,
+    String? errorMessage,
+  }) {
+    return AuthState(
+      status: status ?? this.status,
+      user: user ?? this.user,
+      errorMessage: errorMessage ?? this.errorMessage,
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/data/secure_storage_client.dart",
+    category: "auth",
+    description: "Wraps Keychain and EncryptedSharedPreferences with hardware security attributes.",
+    content: `import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+class SecureStorageClient {
+  final FlutterSecureStorage _storage;
+
+  SecureStorageClient({FlutterSecureStorage? storage})
+      : _storage = storage ?? const FlutterSecureStorage(
+          aOptions: AndroidOptions(encryptedSharedPreferences: true),
+          iOptions: IOSOptions(accessibility: KeychainAccessibility.after_first_unlock_this_device_only),
+        );
+
+  Future<void> writeAccessToken(String token) async {
+    await _storage.write(key: 'access_token', value: token);
   }
 
-  Future<bool> rotateRefreshTokens() async {
-    final refreshToken = await _storage.read(key: "refresh_token");
-    if (refreshToken == null) return false;
+  Future<String?> readAccessToken() async {
+    return await _storage.read(key: 'access_token');
+  }
+
+  Future<void> deleteAccessToken() async {
+    await _storage.delete(key: 'access_token');
+  }
+
+  Future<void> writeRefreshToken(String token) async {
+    await _storage.write(key: 'refresh_token', value: token);
+  }
+
+  Future<String?> readRefreshToken() async {
+    return await _storage.read(key: 'refresh_token');
+  }
+
+  Future<void> deleteRefreshToken() async {
+    await _storage.delete(key: 'refresh_token');
+  }
+
+  Future<void> writeCachedUser(String userJson) async {
+    await _storage.write(key: 'cached_user_profile', value: userJson);
+  }
+
+  Future<String?> readCachedUser() async {
+    return await _storage.read(key: 'cached_user_profile');
+  }
+
+  Future<void> deleteCachedUser() async {
+    await _storage.delete(key: 'cached_user_profile');
+  }
+
+  Future<void> clearAll() async {
+    await _storage.delete(key: 'access_token');
+    await _storage.delete(key: 'refresh_token');
+    await _storage.delete(key: 'cached_user_profile');
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/data/auth_repository.dart",
+    category: "auth",
+    description: "Data broker carrying REST endpoint mappings and error conversions.",
+    content: `import 'dart:convert';
+import 'package:dio/dio.dart';
+import '../domain/user_profile_model.dart';
+
+class AuthRepository {
+  final Dio _dio;
+
+  AuthRepository(this._dio);
+
+  Future<Map<String, dynamic>> login(String email, String password) async {
+    try {
+      final response = await _dio.post('/auth/login', data: {
+        'email': email,
+        'password': password,
+      });
+      return response.data as Map<String, dynamic>;
+    } on DioException catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  Future<Map<String, dynamic>> submitRegistrationRequest({
+    required String givenName,
+    required String callSign,
+    required String email,
+    required String password,
+    required String phone,
+    required UserRole role,
+  }) async {
+    try {
+      final response = await _dio.post('/auth/register-request', data: {
+        'given_name': givenName,
+        'call_sign': callSign,
+        'email': email,
+        'password': password,
+        'phone': phone,
+        'requested_role': role.name,
+      });
+      return response.data as Map<String, dynamic>;
+    } on DioException catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  Future<UserProfileModel> checkApprovalStatus(String userId) async {
+    try {
+      final response = await _dio.get('/auth/profile/status', queryParameters: {'user_id': userId});
+      return UserProfileModel.fromJson(response.data as Map<String, dynamic>);
+    } on DioException catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  Future<String> refreshAccessToken(String refreshToken) async {
+    try {
+      final response = await _dio.post('/auth/refresh', data: {
+        'refresh_token': refreshToken,
+      });
+      return response.data['access_token'] as String;
+    } on DioException catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  Exception _handleError(DioException err) {
+    if (err.response != null) {
+      final status = err.response!.statusCode;
+      final errorMsg = err.response!.data?['message'] ?? 'Unknown network error';
+      if (status == 401) return Exception('Authentication failed: \$errorMsg');
+      if (status == 403) return Exception('Access Denied: \$errorMsg');
+      if (status == 409) return Exception('Conflict error: \$errorMsg');
+      return Exception('Server error (\$status): \$errorMsg');
+    }
+    return Exception('Network unavailable: Check your connection');
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/providers/auth_notifier.dart",
+    category: "auth",
+    description: "Coordinates auth transitions, secure memory registers and polling events for approval tracking.",
+    content: `import 'dart:async';
+import 'dart:convert';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../domain/auth_state.dart';
+import '../domain/user_profile_model.dart';
+import '../data/secure_storage_client.dart';
+import '../data/auth_repository.dart';
+import '../../../core/network/dio_client.dart';
+
+// Provides Secure Storage instance
+final secureStorageProvider = Provider<SecureStorageClient>((ref) {
+  return SecureStorageClient();
+});
+
+// Provides Auth Repository instance
+final authRepositoryProvider = Provider<AuthRepository>((ref) {
+  final dio = ref.watch(dioClientProvider).dio;
+  return AuthRepository(dio);
+});
+
+// Primary auth StateNotifier
+final authProvider = StateNotifierProvider<AuthNotifier, AuthState>((ref) {
+  return AuthNotifier(ref);
+});
+
+class AuthNotifier extends StateNotifier<AuthState> {
+  final Ref _ref;
+  Timer? _statusPollTimer;
+
+  AuthNotifier(this._ref) : super(const AuthState()) {
+    _tryAutoRestoreSession();
+  }
+
+  Future<void> _tryAutoRestoreSession() async {
+    state = state.copyWith(status: AuthStatus.loading);
+    final secureClient = _ref.read(secureStorageProvider);
 
     try {
-      // Execute rotation query against primary credential gateway
-      // Code pattern follows standard API definition
-      // final response = await baseDio.post('/auth/refresh', data: {'refresh_token': refreshToken});
-      // await _storage.write(key: "access_token", value: response.data['access_token']);
-      return true;
-    } catch (_) {
-      return false;
+      final accessToken = await secureClient.readAccessToken();
+      final cachedUserJson = await secureClient.readCachedUser();
+
+      if (accessToken != null && cachedUserJson != null) {
+        final profile = UserProfileModel.fromJson(jsonDecode(cachedUserJson) as Map<String, dynamic>);
+        
+        if (profile.approvalStatus == ApprovalStatus.approved) {
+          state = AuthState(status: AuthStatus.authenticated, user: profile);
+        } else if (profile.approvalStatus == ApprovalStatus.pendingApproval) {
+          state = AuthState(status: AuthStatus.pendingApproval, user: profile);
+          _startStatusPolling(profile.id);
+        } else {
+          state = const AuthState(status: AuthStatus.unauthenticated);
+        }
+      } else {
+        state = const AuthState(status: AuthStatus.unauthenticated);
+      }
+    } catch (e) {
+      state = AuthState(status: AuthStatus.error, errorMessage: e.toString());
     }
   }
 
   Future<bool> login(String email, String password) async {
-    state = state.copyWith(isLoading: true);
-    
-    try {
-      // Emulate validation post
-      await Future.delayed(const Duration(milliseconds: 1200));
-      
-      await _storage.write(key: "access_token", value: "jwt_mock_access_token_guid");
-      await _storage.write(key: "refresh_token", value: "jwt_mock_refresh_token_guid");
+    state = state.copyWith(status: AuthStatus.loading);
+    final repo = _ref.read(authRepositoryProvider);
+    final secureClient = _ref.read(secureStorageProvider);
 
-      state = AuthState(
-         isAuthenticated: true,
-         userId: "913f99e4-fa86-4e5b-b9d9-95e3437ffcbd",
-         role: UserRole.coordinator,
-      );
+    try {
+      // In virtual demo sandbox mode, mock successful authentication response
+      if (email.contains("demo@rescuer.org")) {
+        await Future.delayed(const Duration(milliseconds: 800));
+        final profile = UserProfileModel(
+          id: "volt-demo-id",
+          givenName: "Иван Иванов",
+          callSign: "Байкал-50",
+          email: "demo@rescuer.org",
+          phone: "+7 999 123-45-67",
+          role: UserRole.volunteer,
+          approvalStatus: ApprovalStatus.approved,
+        );
+        await secureClient.writeAccessToken("mock_demo_access_token_jwt");
+        await secureClient.writeRefreshToken("mock_demo_refresh_token_jwt");
+        await secureClient.writeCachedUser(jsonEncode(profile.toJson()));
+        state = AuthState(status: AuthStatus.authenticated, user: profile);
+        return true;
+      }
+
+      final data = await repo.login(email, password);
+      final accessToken = data['access_token'] as String;
+      final refreshToken = data['refresh_token'] as String;
+      final profile = UserProfileModel.fromJson(data['user'] as Map<String, dynamic>);
+
+      await secureClient.writeAccessToken(accessToken);
+      await secureClient.writeRefreshToken(refreshToken);
+      await secureClient.writeCachedUser(jsonEncode(profile.toJson()));
+
+      if (profile.approvalStatus == ApprovalStatus.approved) {
+        state = AuthState(status: AuthStatus.authenticated, user: profile);
+      } else if (profile.approvalStatus == ApprovalStatus.pendingApproval) {
+        state = AuthState(status: AuthStatus.pendingApproval, user: profile);
+        _startStatusPolling(profile.id);
+      } else {
+        throw Exception('Account has been rejected by administration');
+      }
       return true;
-    } catch (_) {
-      state = state.copyWith(isLoading: false);
+    } catch (e) {
+      state = AuthState(status: AuthStatus.unauthenticated, errorMessage: e.toString());
       return false;
     }
   }
 
+  Future<bool> submitRegistrationRequest({
+    required String givenName,
+    required String callSign,
+    required String email,
+    required String password,
+    required String phone,
+    required UserRole role,
+  }) async {
+    state = state.copyWith(status: AuthStatus.loading);
+    final repo = _ref.read(authRepositoryProvider);
+    final secureClient = _ref.read(secureStorageProvider);
+
+    try {
+      final data = await repo.submitRegistrationRequest(
+        givenName: givenName,
+        callSign: callSign,
+        email: email,
+        password: password,
+        phone: phone,
+        role: role,
+      );
+
+      final profile = UserProfileModel.fromJson(data['user'] as Map<String, dynamic>);
+      await secureClient.writeCachedUser(jsonEncode(profile.toJson()));
+
+      state = AuthState(status: AuthStatus.pendingApproval, user: profile);
+      _startStatusPolling(profile.id);
+      return true;
+    } catch (e) {
+      state = AuthState(status: AuthStatus.unauthenticated, errorMessage: e.toString());
+      return false;
+    }
+  }
+
+  void _startStatusPolling(String userId) {
+    _statusPollTimer?.cancel();
+    _statusPollTimer = Timer.periodic(const Duration(seconds: 15), (timer) async {
+      try {
+        final repo = _ref.read(authRepositoryProvider);
+        final currentProfile = await repo.checkApprovalStatus(userId);
+
+        if (currentProfile.approvalStatus == ApprovalStatus.approved) {
+          timer.cancel();
+          final secureClient = _ref.read(secureStorageProvider);
+          await secureClient.writeCachedUser(jsonEncode(currentProfile.toJson()));
+          state = AuthState(status: AuthStatus.authenticated, user: currentProfile);
+        } else if (currentProfile.approvalStatus == ApprovalStatus.rejected) {
+          timer.cancel();
+          logout();
+        }
+      } catch (e) {
+        print("[AUTH POLL] Status poll failed: \$e");
+      }
+    });
+  }
+
+  Future<bool> rotateRefreshTokens() async {
+    final secureClient = _ref.read(secureStorageProvider);
+    final repo = _ref.read(authRepositoryProvider);
+    final rToken = await secureClient.readRefreshToken();
+
+    if (rToken == null) return false;
+
+    try {
+      final newAccessToken = await repo.refreshAccessToken(rToken);
+      await secureClient.writeAccessToken(newAccessToken);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<String?> getAccessToken() async {
+    return await _ref.read(secureStorageProvider).readAccessToken();
+  }
+
   Future<void> logout() async {
-    await _storage.delete(key: "access_token");
-    await _storage.delete(key: "refresh_token");
-    state = AuthState();
+    _statusPollTimer?.cancel();
+    await _ref.read(secureStorageProvider).clearAll();
+    state = const AuthState(status: AuthStatus.unauthenticated);
+  }
+
+  @override
+  void dispose() {
+    _statusPollTimer?.cancel();
+    super.dispose();
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/presentation/session_loading_screen.dart",
+    category: "auth-presentation",
+    description: "Primary system landing screen which restores cached device sessions.",
+    content: `import 'package:flutter/material.dart';
+
+class SessionLoadingScreen extends StatelessWidget {
+  const SessionLoadingScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: Color(0xFF0F172A),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            SizedBox(
+              width: 48,
+              height: 48,
+              child: CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xFFE53E3E)),
+                strokeWidth: 3.5,
+              ),
+            ),
+            SizedBox(height: 28),
+            Text(
+              'RESCUER HQ',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+                letterSpacing: 2.8,
+              ),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'REPLICATING AUTHENTICATION REGISTERS...',
+              style: TextStyle(
+                color: Colors.slate-400,
+                fontSize: 10,
+                fontWeight: FontWeight.w500,
+                letterSpacing: 1.2,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/presentation/login_screen.dart",
+    category: "auth-presentation",
+    description: "Operational login layout displaying credential validation alerts.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import '../providers/auth_notifier.dart';
+
+class LoginScreen extends ConsumerStatefulWidget {
+  const LoginScreen({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends ConsumerState<LoginScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final authState = ref.watch(authProvider);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0B0E),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 28),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE53E3E),
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFFE53E3E).withOpacity(0.35),
+                      blurRadius: 16,
+                      offset: const Offset(0, 6),
+                    )
+                  ],
+                ),
+                child: const Icon(Icons.shield_outlined, color: Colors.white, size: 32),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                'Rescuer HQ',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Missing Children Search Coordination Platform',
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 32),
+              if (authState.errorMessage != null)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  margin: const EdgeInsets.only(bottom: 18),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.red.withOpacity(0.25)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.error_outline, color: Colors.redAccent, size: 18),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          authState.errorMessage!,
+                          style: const TextStyle(color: Colors.white70, fontSize: 11),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              Form(
+                key: _formKey,
+                child: Column(
+                  children: [
+                    TextFormField(
+                      controller: _emailController,
+                      style: const TextStyle(color: Colors.white, fontSize: 14),
+                      decoration: InputDecoration(
+                        labelText: 'Operational Email',
+                        labelStyle: const TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                        prefixIcon: const Icon(Icons.email_outlined, color: Color(0xFF64748B), size: 18),
+                        filled: true,
+                        fillColor: const Color(0xFF1E293B),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: const BorderSide(color: Color(0xFFE53E3E), width: 1.5),
+                        ),
+                      ),
+                      validator: (val) => (val == null || !val.contains('@')) ? 'Provide operational email' : null,
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _passwordController,
+                      obscureText: true,
+                      style: const TextStyle(color: Colors.white, fontSize: 14),
+                      decoration: InputDecoration(
+                        labelText: 'Symmetric Password',
+                        labelStyle: const TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                        prefixIcon: const Icon(Icons.lock_outline, color: Color(0xFF64748B), size: 18),
+                        filled: true,
+                        fillColor: const Color(0xFF1E293B),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: const BorderSide(color: Color(0xFFE53E3E), width: 1.5),
+                        ),
+                      ),
+                      validator: (val) => (val == null || val.length < 6) ? 'Password must exceed 6 symbols' : null,
+                    ),
+                    const SizedBox(height: 28),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFE53E3E),
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                          elevation: 0,
+                        ),
+                        onPressed: authState.isLoading
+                            ? null
+                            : () async {
+                                if (_formKey.currentState!.validate()) {
+                                  await ref.read(authProvider.notifier).login(
+                                        _emailController.text.trim(),
+                                        _passwordController.text.trim(),
+                                      );
+                                }
+                              },
+                        child: authState.isLoading
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                              )
+                            : const Text(
+                                'AUTHENTICATE ACCESS',
+                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 1.2),
+                              ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // Quick Demo Sandbox Access Line
+                    SizedBox(
+                      width: double.infinity,
+                      height: 40,
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF94A3B8),
+                          side: const BorderSide(color: Color(0xFF334155)),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                        ),
+                        onPressed: authState.isLoading
+                            ? null
+                            : () async {
+                                _emailController.text = "demo@rescuer.org";
+                                _passwordController.text = "demo_password_123";
+                                await ref.read(authProvider.notifier).login(
+                                      "demo@rescuer.org",
+                                      "demo_password_123",
+                                    );
+                              },
+                        child: const Text('BYPASS VIA DEMO VOLUNTEER', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    TextButton(
+                      child: const Text(
+                        'SUBMIT NEW VOLUNTEER APPLICATION',
+                        style: TextStyle(color: Color(0xFFE53E3E), fontSize: 12, fontWeight: FontWeight.bold),
+                      ),
+                      onPressed: () {
+                        context.push('/register-request');
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/presentation/registration_request_screen.dart",
+    category: "auth-presentation",
+    description: "Volunteer operational application form including regional unit roles selection.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import '../domain/user_profile_model.dart';
+import '../providers/auth_notifier.dart';
+
+class RegistrationRequestScreen extends ConsumerStatefulWidget {
+  const RegistrationRequestScreen({Key? key}) : super(key: key);
+
+  @override
+  ConsumerState<RegistrationRequestScreen> createState() => _RegistrationRequestScreenState();
+}
+
+class _RegistrationRequestScreenState extends ConsumerState<RegistrationRequestScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _callSignController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _passController = TextEditingController();
+  final _phoneController = TextEditingController();
+  UserRole _selectedRole = UserRole.volunteer;
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _callSignController.dispose();
+    _emailController.dispose();
+    _passController.dispose();
+    _phoneController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final authState = ref.watch(authProvider);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0B0E),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => context.pop(),
+        ),
+        title: const Text('Volunteer Application', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Join Search Operations Network',
+                style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Submit your radio call-sign and personal credentials. Registration requests require moderator verification.',
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+              ),
+              const SizedBox(height: 28),
+              
+              TextFormField(
+                controller: _nameController,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: _fieldDecoration('Full Name', Icons.person_outline),
+                validator: (val) => (val == null || val.length < 3) ? 'Provide actual name' : null,
+              ),
+              const SizedBox(height: 16),
+              
+              TextFormField(
+                controller: _callSignController,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: _fieldDecoration('Call Sign (Позывной для связи)', Icons.radio_outlined),
+                validator: (val) => (val == null || val.isEmpty) ? 'Provide radio callsign / ID prefix' : null,
+              ),
+              const SizedBox(height: 16),
+              
+              TextFormField(
+                controller: _phoneController,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: _fieldDecoration('Phone number', Icons.phone_android),
+                validator: (val) => (val == null || val.length < 10) ? 'Enter operational cell' : null,
+              ),
+              const SizedBox(height: 16),
+              
+              TextFormField(
+                controller: _emailController,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: _fieldDecoration('Email address', Icons.email_outlined),
+                validator: (val) => (val == null || !val.contains('@')) ? 'Provide operational email' : null,
+              ),
+              const SizedBox(height: 16),
+              
+              TextFormField(
+                controller: _passController,
+                obscureText: true,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: _fieldDecoration('Security Password', Icons.lock_outline),
+                validator: (val) => (val == null || val.length < 6) ? 'Password must exceed 6 signs' : null,
+              ),
+              const SizedBox(height: 20),
+              
+              const Text('Requested Role Assignment', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<UserRole>(
+                value: _selectedRole,
+                dropdownColor: const Color(0xFF1E293B),
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: InputDecoration(
+                  filled: true,
+                  fillColor: const Color(0xFF1E293B),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                ),
+                items: const [
+                  DropdownMenuItem(value: UserRole.volunteer, child: Text('Search Rescue Volunteer')),
+                  DropdownMenuItem(value: UserRole.operator, child: Text('Operational Radio Operator')),
+                  DropdownMenuItem(value: UserRole.coordinator, child: Text('Incident Sector Coordinator')),
+                ],
+                onChanged: (role) {
+                  if (role != null) setState(() => _selectedRole = role);
+                },
+              ),
+              const SizedBox(height: 32),
+              
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFE53E3E),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  onPressed: authState.isLoading
+                      ? null
+                      : () async {
+                          if (_formKey.currentState!.validate()) {
+                            final success = await ref.read(authProvider.notifier).submitRegistrationRequest(
+                                  givenName: _nameController.text.trim(),
+                                  callSign: _callSignController.text.trim(),
+                                  email: _emailController.text.trim(),
+                                  password: _passController.text.trim(),
+                                  phone: _phoneController.text.trim(),
+                                  role: _selectedRole,
+                                );
+                            if (success && mounted) {
+                              // Auto redirects on polling trigger
+                            }
+                          }
+                        },
+                  child: authState.isLoading
+                      ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : const Text('SUBMIT ENLISTMENT APPLICATION', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  InputDecoration _fieldDecoration(String label, IconData icon) {
+    return InputDecoration(
+      labelText: label,
+      labelStyle: const TextStyle(color: Color(0xFF64748B), fontSize: 13),
+      prefixIcon: Icon(icon, color: const Color(0xFF64748B), size: 18),
+      filled: true,
+      fillColor: const Color(0xFF1E293B),
+      enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: const BorderSide(color: Color(0xFFE53E3E), width: 1.5)),
+    );
+  }
+}`
+  },
+  {
+    path: "lib/features/auth/presentation/pending_approval_screen.dart",
+    category: "auth-presentation",
+    description: "Waiting overlay presenting ongoing moderator verification polling.",
+    content: `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/auth_notifier.dart';
+
+class PendingApprovalScreen extends ConsumerWidget {
+  const PendingApprovalScreen({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final authState = ref.watch(authProvider);
+    final userProfile = authState.user;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0B0E),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // Pulsating radar verification ring
+              Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: 88,
+                    height: 88,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: const Color(0xFFF59E0B).withOpacity(0.12),
+                    ),
+                  ),
+                  Container(
+                    width: 64,
+                    height: 64,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: const Color(0xFFF59E0B).withOpacity(0.25),
+                    ),
+                    child: const Icon(
+                      Icons.hourglass_empty_outlined,
+                      color: Color(0xFFF59E0B),
+                      size: 28,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 32),
+              const Text(
+                'Awaiting Verification',
+                style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                'Your credentials are securely submitted to the regional crisis center. An IT Admin will verify your radio call sign.',
+                style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12, height: 1.4),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 24),
+              if (userProfile != null)
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF334155)),
+                  ),
+                  child: Column(
+                    children: [
+                      _infoRow('Call Sign', userProfile.callSign),
+                      _divider(),
+                      _infoRow('Call Name', userProfile.givenName),
+                      _divider(),
+                      _infoRow('Assigned Unit', userProfile.role.name.toUpperCase()),
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 36),
+              // Simulated continuous polling ticker
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(
+                      color: Color(0xFFF59E0B),
+                      strokeWidth: 1.5,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    'POLLING FOR APPROVAL SIGNAL...',
+                    style: TextStyle(
+                      color: const Color(0xFFF59E0B).withOpacity(0.8),
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.1,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 48),
+              SizedBox(
+                width: double.infinity,
+                height: 44,
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFFEF4444),
+                    side: const BorderSide(color: Color(0xFFEF4444), width: 1.2),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  onPressed: () {
+                    ref.read(authProvider.notifier).logout();
+                  },
+                  child: const Text('CANCEL REGISTRATION APPLICATION', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _infoRow(String label, String val) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.between,
+      children: [
+        Text(label, style: const TextStyle(color: Color(0xFF64748B), fontSize: 12)),
+        Text(val, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+      ],
+    );
+  }
+
+  Widget _divider() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Divider(color: const Color(0xFF334155).withOpacity(0.5), height: 1),
+    );
   }
 }`
   }
