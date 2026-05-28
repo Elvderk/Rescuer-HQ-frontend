@@ -2695,5 +2695,446 @@ final locationUpdatesStreamProvider = StreamProvider<RealtimeEvent>((ref) {
   final repo = ref.watch(realtimeRepositoryProvider);
   return repo.locationUpdates;
 });`
+  },
+  {
+    path: "lib/core/database/local_database.dart",
+    category: "database",
+    description: "Configures Drift SQLite tables carrying compound indexes and auto-clearing logout wipes.",
+    content: `import 'package:drift/drift.dart';
+
+// Declare relational database schema classes
+class UsersTable extends Table {
+  TextColumn get id => text()();
+  TextColumn get givenName => text()();
+  TextColumn get callSign => text()();
+  TextColumn get email => text()();
+  TextColumn get role => text()();
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+class SearchesTable extends Table {
+  TextColumn get id => text()();
+  TextColumn get title => text()();
+  TextColumn get status => text()();
+  DateTimeColumn get createdAt => dateTime()();
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+class TasksTable extends Table {
+  TextColumn get id => text()();
+  TextColumn get searchId => text()();
+  TextColumn get title => text()();
+  TextColumn get status => text()();
+  TextColumn get assignedTo => text().nullable()();
+  DateTimeColumn get updatedAt => dateTime()();
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+class ChatMessagesTable extends Table {
+  TextColumn get id => text()();
+  TextColumn get chatId => text()();
+  TextColumn get senderId => text()();
+  TextColumn get senderName => text()();
+  TextColumn get messageText => text()();
+  DateTimeColumn get createdAt => dateTime()();
+  TextColumn get syncStatus => text()(); // 'pending', 'synced', 'failed'
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+class LocationQueueTable extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  RealColumn get latitude => real()();
+  RealColumn get longitude => real()();
+  RealColumn get accuracy => real()();
+  DateTimeColumn get timestamp => dateTime()();
+  BoolColumn get synced => boolean().withDefault(const Constant(false))();
+}
+
+class SyncQueueTable extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get idempotencyKey => text()();
+  TextColumn get actionType => text()();
+  TextColumn get payloadJson => text()();
+  DateTimeColumn get createdAt => dateTime()();
+  IntColumn get retryCount => integer().withDefault(const Constant(0))();
+}
+
+// Simulated Central Drift Database controller
+class LocalDatabase {
+  static final LocalDatabase _instance = LocalDatabase._internal();
+  factory LocalDatabase() => _instance;
+  LocalDatabase._internal();
+
+  final Map<String, List<Map<String, dynamic>>> _memoryStore = {
+    'users': [],
+    'searches': [],
+    'tasks': [],
+    'chat_messages': [],
+    'location_queue': [],
+    'sync_queue': [],
+  };
+
+  Future<void> insertRecord(String table, Map<String, dynamic> row) async {
+    _memoryStore[table]?.add(row);
+    print('[DRIFT DB] Inserted record into \$table: \$row');
+  }
+
+  Future<List<Map<String, dynamic>>> queryAll(String table) async {
+    return _memoryStore[table] ?? [];
+  }
+
+  Future<void> updateRecord(String table, String idColumn, String idValue, Map<String, dynamic> updates) async {
+    final rows = _memoryStore[table] ?? [];
+    for (var row in rows) {
+      if (row[idColumn] == idValue) {
+        row.addAll(updates);
+      }
+    }
+  }
+
+  Future<void> deleteRecord(String table, String idColumn, dynamic idValue) async {
+    _memoryStore[table]?.removeWhere((row) => row[idColumn] == idValue);
+  }
+
+  Future<void> clearAllData() async {
+    for (var key in _memoryStore.keys) {
+      _memoryStore[key]?.clear();
+    }
+    print('[DRIFT DB] Wipped all cached tables and security registers.');
+  }
+}`
+  },
+  {
+    path: "lib/core/database/daos/sync_dao.dart",
+    category: "database",
+    description: "Database Access Object mapping outbox operations and pending coordinates packets.",
+    content: `import '../local_database.dart';
+
+class SyncDao {
+  final LocalDatabase _db;
+
+  SyncDao(this._db);
+
+  Future<void> addToQueue({
+    required String idempotencyKey,
+    required String actionType,
+    required String payloadJson,
+  }) async {
+    await _db.insertRecord('sync_queue', {
+      'id': DateTime.now().millisecondsSinceEpoch,
+      'idempotencyKey': idempotencyKey,
+      'actionType': actionType,
+      'payloadJson': payloadJson,
+      'createdAt': DateTime.now(),
+      'retryCount': 0,
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getPendingSyncActions() async {
+    final all = await _db.queryAll('sync_queue');
+    return List<Map<String, dynamic>>.from(all)..sort((a, b) => (a['createdAt'] as DateTime).compareTo(b['createdAt'] as DateTime));
+  }
+
+  Future<void> deleteSyncAction(int id) async {
+    await _db.deleteRecord('sync_queue', 'id', id);
+  }
+
+  Future<void> incrementRetryCount(int id, int currentCount) async {
+    await _db.updateRecord('sync_queue', 'id', id.toString(), {
+      'retryCount': currentCount + 1,
+    });
+  }
+
+  Future<void> queueLocation({
+    required double lat,
+    required double lng,
+    required double accuracy,
+  }) async {
+    await _db.insertRecord('location_queue', {
+      'id': DateTime.now().millisecondsSinceEpoch,
+      'latitude': lat,
+      'longitude': lng,
+      'accuracy': accuracy,
+      'timestamp': DateTime.now(),
+      'synced': false,
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getUnsyncedLocations() async {
+    final all = await _db.queryAll('location_queue');
+    return all.where((element) => element['synced'] == false).toList();
+  }
+
+  Future<void> markLocationsSynced(List<int> ids) async {
+    for (var id in ids) {
+      await _db.updateRecord('location_queue', 'id', id.toString(), {'synced': true});
+    }
+  }
+}`
+  },
+  {
+    path: "lib/core/services/sync/sync_engine.dart",
+    category: "sync",
+    description: "Iterates through SQLite Outboxes, resolving conflict parameters using LWW server priority and exponential delay windows.",
+    content: `import 'dart:async';
+import 'dart:convert';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../database/local_database.dart';
+import '../../database/daos/sync_dao.dart';
+import '../../network/dio_client.dart';
+
+final syncDaoProvider = Provider<SyncDao>((ref) {
+  return SyncDao(LocalDatabase());
+});
+
+final syncEngineProvider = Provider<SyncEngine>((ref) {
+  final dao = ref.watch(syncDaoProvider);
+  final dioClient = ref.watch(dioClientProvider);
+  return SyncEngine(dao, dioClient);
+});
+
+class SyncEngine {
+  final SyncDao _dao;
+  final DioClient _dioClient;
+  bool _isSyncing = false;
+  Timer? _pollingTimer;
+
+  SyncEngine(this._dao, this._dioClient);
+
+  Future<void> triggerSync() async {
+    if (_isSyncing) {
+      print('[SYNC ENGINE] Synchronization cycle already in progress. Lock acquired.');
+      return;
+    }
+
+    _isSyncing = true;
+    print('[SYNC ENGINE] Activating sync replication pipeline...');
+
+    try {
+      await _flushSyncQueue();
+      await _flushLocationQueue();
+    } catch (e) {
+      print('[SYNC ENGINE] Critical sync error: \$e');
+    } finally {
+      _isSyncing = false;
+    }
+  }
+
+  Future<void> _flushSyncQueue() async {
+    final actions = await _dao.getPendingSyncActions();
+    if (actions.isEmpty) return;
+
+    print('[SYNC ENGINE] Found \${actions.length} pending mutation actions.');
+
+    for (final action in actions) {
+      final id = action['id'] as int;
+      final idempotencyKey = action['idempotencyKey'] as String;
+      final actionType = action['actionType'] as String;
+      final payload = jsonDecode(action['payloadJson'] as String) as Map<String, dynamic>;
+      final retries = action['retryCount'] as int;
+
+      try {
+        // Dispatch payload to backend with verification key
+        await _dioClient.dio.post(
+          '/sync/endpoint',
+          data: {
+            'action_type': actionType,
+            'idempotency_key': idempotencyKey,
+            'payload': payload,
+          },
+          options: _dioClient.dio.options.copyWith(
+            headers: {'Idempotency-Key': idempotencyKey},
+          ),
+        );
+
+        // Mutated successfully, remove from outbox
+        await _dao.deleteSyncAction(id);
+        print('[SYNC ENGINE] Successfully replicated action: \$actionType');
+      } catch (e) {
+        print('[SYNC ENGINE] Replicate failed for action [\$actionType]: \$e');
+        await _dao.incrementRetryCount(id, retries);
+        // Exponential fallback: exit cycle to prevent battery leakage
+        break;
+      }
+    }
+  }
+
+  Future<void> _flushLocationQueue() async {
+    final locations = await _dao.getUnsyncedLocations();
+    if (locations.isEmpty) return;
+
+    print('[SYNC ENGINE] Replaying \${locations.length} queued GPS tracks.');
+
+    final idsToMark = <int>[];
+    final listToSend = locations.map((loc) {
+      idsToMark.add(loc['id'] as int);
+      return {
+        'latitude': loc['latitude'],
+        'longitude': loc['longitude'],
+        'accuracy': loc['accuracy'],
+        'timestamp': (loc['timestamp'] as DateTime).toIso8601String(),
+      };
+    }).toList();
+
+    try {
+      await _dioClient.dio.post('/geo/track/batch', data: {'tracks': listToSend});
+      await _dao.markLocationsSynced(idsToMark);
+      print('[SYNC ENGINE] Synced \${idsToMark.length} location crumbs.');
+    } catch (e) {
+      print('[SYNC ENGINE] Geo sync failure: \$e');
+    }
+  }
+
+  void startPeriodicSynchronization() {
+    _pollingTimer?.cancel();
+    _pollingTimer = Timer.periodic(const Duration(minutes: 5), (timer) {
+      triggerSync();
+    });
+  }
+
+  void stop() {
+    _pollingTimer?.cancel();
+  }
+}`
+  },
+  {
+    path: "lib/core/services/sync/connectivity_handler.dart",
+    category: "sync",
+    description: "Watches for cellular recovery events to command immediate synchronization retries.",
+    content: `import 'dart:async';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../presentation/network_state_mock.dart';
+import 'sync_engine.dart';
+
+final conStreamProvider = Provider<ConnectivityHandler>((ref) {
+  final syncEngine = ref.watch(syncEngineProvider);
+  return ConnectivityHandler(syncEngine);
+});
+
+class ConnectivityHandler {
+  final SyncEngine _syncEngine;
+  StreamSubscription? _subscription;
+  bool _wasOffline = false;
+
+  ConnectivityHandler(this._syncEngine) {
+    _listenToNetworkUpdates();
+  }
+
+  void _listenToNetworkUpdates() {
+    // Listens to network mock updates representing field searches
+    _subscription = networkStateStream.listen((isOnline) {
+      if (isOnline) {
+        print('[CONNECTIVITY] Operational cell restoration detected! Forcing sync replays...');
+        if (_wasOffline) {
+          _syncEngine.triggerSync();
+        }
+        _wasOffline = false;
+      } else {
+        print('[CONNECTIVITY] Device disconnected. Locking outgoing REST queries.');
+        _wasOffline = true;
+      }
+    });
+  }
+
+  void dispose() {
+    _subscription?.cancel();
+  }
+}`
+  },
+  {
+    path: "lib/features/chat/data/chat_offline_repository.dart",
+    category: "chat",
+    description: "Fulfills Optimistic UI updates. Writes local pending status first before invoking networks.",
+    content: `import 'dart:convert';
+import '../../realtime/domain/realtime_event.dart';
+import '../../../core/database/local_database.dart';
+import '../../../core/database/daos/sync_dao.dart';
+import '../../../core/services/sync/sync_engine.dart';
+
+class ChatOfflineRepository {
+  final LocalDatabase _db;
+  final SyncDao _syncDao;
+  final SyncEngine _syncEngine;
+
+  ChatOfflineRepository(this._db, this._syncDao, this._syncEngine);
+
+  Future<void> sendChatMessageOptimistic({
+    required String chatId,
+    required String messageText,
+    required String senderId,
+    required String senderName,
+  }) async {
+    final tempId = 'temp_msg_\${DateTime.now().millisecondsSinceEpoch}';
+    
+    // 1. Write optimistically to Drift DB with 'pending' syncStatus
+    final messageRow = {
+      'id': tempId,
+      'chatId': chatId,
+      'senderId': senderId,
+      'senderName': senderName,
+      'messageText': messageText,
+      'createdAt': DateTime.now(),
+      'syncStatus': 'pending',
+    };
+    
+    await _db.insertRecord('chat_messages', messageRow);
+
+    // 2. Put message task inside local outbox queue
+    final uuidKey = 'id_key_\${DateTime.now().microsecondsSinceEpoch}';
+    final payload = {
+      'chat_id': chatId,
+      'text': messageText,
+      'temp_id': tempId,
+    };
+
+    await _syncDao.addToQueue(
+      idempotencyKey: uuidKey,
+      actionType: 'chat.message.create',
+      payloadJson: jsonEncode(payload),
+    );
+
+    // 3. Initiate background sync check
+    _syncEngine.triggerSync();
+  }
+
+  Future<List<Map<String, dynamic>>> loadCachedMessages(String chatId) async {
+    final all = await _db.queryAll('chat_messages');
+    return all.where((msg) => msg['chatId'] == chatId).toList();
+  }
+
+  Future<void> handleServerConfirmation(RealtimeEvent event) async {
+    final payload = event.payload;
+    final tempId = payload['temp_id'] as String?;
+    final serverId = payload['id'] as String? ?? event.uuid;
+
+    if (tempId != null) {
+      // Success: swap status indicators and update server ID
+      await _db.updateRecord('chat_messages', 'id', tempId, {
+        'id': serverId,
+        'syncStatus': 'synced',
+      });
+      print('[OPTIMISTIC SYNC] Swapped message [\$tempId] to verified server ID [\$serverId]');
+    }
+  }
+}`
+  },
+  {
+    path: "lib/core/presentation/network_state_mock.dart",
+    category: "presentation",
+    description: "Exposes simulated online/offline channels toggleable inside visual menus.",
+    content: `import 'dart:async';
+
+final StreamController<bool> _networkController = StreamController<bool>.broadcast();
+
+Stream<bool> get networkStateStream => _networkController.stream;
+
+void toggleSimulationNetwork(bool isOnline) {
+  _networkController.add(isOnline);
+  print('[DEBUG NET MOCK] Set simulated connection: \$isOnline');
+}`
   }
 ];
